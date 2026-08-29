@@ -1,0 +1,58 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/shftwst/.local/bin/faff runcheck --hook"
+          },
+          {
+            "type": "command",
+            "command": "/Users/shftwst/.local/bin/faff prepcheck --hook"
+          },
+          {
+            "type": "command",
+            "command": "/Users/shftwst/.local/bin/faff sentrycheck --hook"
+          },
+          {
+            "type": "command",
+            "command": "/Users/shftwst/.local/bin/faff inflightcheck --hook"
+          },
+          {
+            "type": "command",
+            "command": "/Users/shftwst/.local/bin/faff resumecheck --hook"
+          },
+          {
+            "type": "command",
+            "command": "/Users/shftwst/.local/bin/faff turncheck --hook"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/shftwst/.local/bin/faff merge-fence --hook"
+          },
+          {
+            "type": "command",
+            "command": "/Users/shftwst/.local/bin/faff background-fence --hook"
+          }
+        ]
+      },
+      {
+        "matcher": "Monitor",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/shftwst/.local/bin/faff background-fence --hook"
+          }
+        ]
+      }
+    ]
+  }
+}

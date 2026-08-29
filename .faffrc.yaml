@@ -1,0 +1,132 @@
+# faff config — SUT P1 (link-shortener). git-only, agile lens, lights-out eligible.
+# The two explicit L4 lights-out dials this SUT needs to clear `faff lights-out --check`
+# dial-coherence: slots.review (adversarial), slots.spec_review (adversarial). The third leg,
+# gates.fallback, is fail-closed BY DEFAULT since FAFF-522 shipped (PR #403) — no explicit line
+# needed (FAFF-524 drops the restated-default line FAFF-513 originally planted here).
+# git-only pin (FAFF-808): the reserved `none` sentinel asserts this repo has no tracker
+# relationship, so every skill resolves git-only BEFORE any MCP discovery and never upgrades to
+# tracker-mode even when the Linear MCP is visible in the cage. This is the supported git-only
+# lever; it replaces the older `--strict-mcp-config` MCP-disable flag RUN-L4 used to carry.
+tracking:
+  tracker: none
+slots:
+  methodology: faffter-dark-methodology-agile-delivery
+  spec: faffter-dark-nlspec
+  architecture: faffter-noon-architecture
+  env: faffter-noon-env-compose
+  evaluator: faffter-noon-evaluate
+  review: faffter-dark-adversarial-review     # L4 dial: adversarial second-opinion (was faffter-noon-review)
+  spec_review: faffter-dark-spec-review       # L4 dial: adversarial spec_review (was unset -> single-pass default)
+appetite: high
+# git-only autonomous on-switch: default opt-in keeps autonomous OFF; opt-out enables it.
+automation_default: opt-out
+intake_gate: warn
+budget:
+  # For L4 lights-out the budget-ceiling gate deliberately EXCLUDES max_attempts (a count is not
+  # an L4 governor) — the real spend governors are budget.cost (dollars, priced from the ADR-0048
+  # map — FAFF-427, the recommended default), budget.tokens, and budget.until. max_attempts may
+  # stay wired as an optional extra backstop only.
+  # `faff budget check` sums cache_read, so a small tokens ceiling breaches before a build lands.
+  max_attempts: 30
+  tokens: 300000000
+  # cost: 15   # optional: budget.cost — the recommended L4 governor (FAFF-427)
+  at_ceiling: stop
+# backends: namespace (FAFF-523/529) — named entries the adversarial `review`/`spec_review` slots'
+# refs below point at; replaces the legacy faffter_dark.adversarial primary+fallbacks scalar block.
+# api_key_env names resolve from .env.claude-box at call time (name only, never the key itself —
+# the box-env copy step below supplies the actual values, gitignored, never committed). Mirrors
+# faff-root's own currently-served model ids. ollama-local is keyless (no .env.claude-box key
+# needed) — its tailnet host is reachable from an in-cage SUT (operator has run this for months).
+backends:
+  gemini-gemma-free:
+      provider: gemini
+      model: models/gemma-4-31b-it # /v1beta/openai lists ids models/-prefixed; the served-check is exact-match
+      host: https://generativelanguage.googleapis.com/v1beta/openai
+      api_key_env: GEMINI_API_KEY
+      #timeout: 480
+  spark-qwen-3-8:
+      provider: openai
+      model: unsloth/Qwen3.8-27B-NVFP4
+      host: https://spark.longhair-escalator.ts.net/qwen-3-8/v1
+      api_key_env: DUMMY_API_KEY
+      # Per-backend first-byte (TTFT) window, seconds. Moved here from adversarial.first_byte_timeout,
+      # which the code silently ignores (first_byte_timeout is read per-backend only, unlike timeout/
+      # deadline). The local 27B's time-to-first-token under the 4-lens fan-out runs ~42-74s, over the
+      # 60s DEFAULT_FIRST_BYTE_MS, so the default breached and the chain fell over to the cloud fallbacks.
+      first_byte_timeout: 600
+      # FAFF-918: bounded reasoning-ON. thinking_token_budget hard-caps reasoning tokens so a
+      # review both reasons AND emits findings (was `reasoning_off: true`, which on qwen suppresses
+      # reasoning entirely and misses real bugs). 2000 is a tunable starting point (FAFF-920); at
+      # max_tokens 32000 it leaves ~30k for findings and clears the empty-out knee comfortably.
+      reasoning_extra:
+          thinking_token_budget: 2000
+  openrouter-deepseek-v4-flash:
+      provider: openai                       # OpenRouter is OpenAI-compatible
+      model: deepseek/deepseek-v4-flash-0731
+      host: https://openrouter.ai/api/v1
+      api_key_env: OPENROUTER_API_KEY
+      reasoning_off: true
+      #timeout: 480
+  openrouter-gemma-paid:
+      provider: openai                       # OpenRouter is OpenAI-compatible
+      model: google/gemma-4-31b-it
+      host: https://openrouter.ai/api/v1
+      api_key_env: OPENROUTER_API_KEY
+      # code_review backup. Same model as gemini-gemma-free but paid via OpenRouter, so no 429 quota
+      # wall (gemma's only code-review failure was HTTP 429, not response shape). Non-reasoning model,
+      # so no reasoning_off / thinking_token_budget needed.
+
+# faffter-dark: adversarial `review`/`spec_review` slots' reference list — points at the named
+# backends: entries above, primary-first (FAFF-523's ordered-reference form, no "primary" key).
+# Flattened to the top-level `adversarial:` key per the schema change on faff main (the older
+# `faffter_dark.adversarial.refs` nesting is retired; a stale local `faff config check` still warns
+# on the flat form).
+adversarial:
+  # Larger deadline for the adversarial reviews. The local studio-qwen primary is slower than a
+  # hosted API, and the default 120s per-attempt clock abandons a slow-but-working generation to a
+  # weaker fallback (the round-3 degrade that helped park the last drain).
+  #
+  # The two review slots treat these knobs DIFFERENTLY (traced from their SKILL.md call sites):
+  #   - spec_review (faffter-dark-spec-review) passes ONLY `--timeout`. It sends no `--deadline`, so
+  #     `adversarial.deadline` below has NO effect on the spec review. `timeout` is its only clock,
+  #     and there is no total wall-clock cap: its worst case is per-attempt x retries x lenses.
+  #   - code_review (faffter-dark-adversarial-review) passes BOTH `--timeout` and `--deadline`. The
+  #     deadline is a total wall-clock budget, GLOBAL (not per-consumer) and SLICED per backend
+  #     (deadline / remaining-backends); each attempt is clamped to min(timeout, slice-now).
+  # Resolution for both: timeout = adversarial.<slot>.timeout || adversarial.timeout || 120.
+  timeout: 900     # per-attempt stream deadline (s); default 120. spec_review's only clock. Sized for a max_tokens:12000 review (~9min at ~22 tok/s) plus large-payload prompt-eval headroom. Was 1500 when max_tokens was 32000 (the empty-out workaround); FAFF-918's thinking_token_budget caps reasoning directly, so reviews finish far sooner.
+  deadline: 2400   # code_review total wall-clock (s), sliced per backend; default 480. MUST exceed timeout*backend-count or the slice clamps every attempt below its own timeout: was 1800 over a 3-backend chain -> 600s slice < 900s timeout, which truncated the slow local primary to empty content (exit 10) and parked otherwise-shippable work. code_review now runs a 2-backend chain -> 2400/2 = 1200s slice > 900s timeout, so no clamp. IGNORED by spec_review (which sends no --deadline).
+  refs:
+    - spark-qwen-3-8
+    - openrouter-deepseek-v4-flash
+    - gemini-gemma-free
+  spec_judge:
+    #keepgoing_bound: 2          # optional; else the SKILL's safe small default
+    refs:
+      - gemini-gemma-free
+      - openrouter-gemma-paid
+  # Per-consumer output-token TOTAL cap (FAFF-911), reasoning + content. Resolution:
+  # adversarial.<consumer>.max_tokens || adversarial.max_tokens || 2000.
+  #
+  # FAFF-918: this was 32000 as the empty-out WORKAROUND — a big total budget so a reasoning
+  # backend that over-reasoned still had room left to emit findings. thinking_token_budget now
+  # caps the REASONING portion directly (see each spark backend's reasoning_extra), so the total
+  # cap no longer has to absorb runaway reasoning. Trimmed to 12000: ~2000 for reasoning (the
+  # per-backend budget) leaves ~10000 for content, comfortable for a large multi-finding review.
+  # INVARIANT: keep max_tokens > every backend's thinking_token_budget, or the budget never binds
+  # (reasoning would hit the total cap first and empty out again — the exact bug this fixes).
+  # Measured: a 70K-token review needed >2000 content tokens to emit well-formed findings on qwen,
+  # so do not trim the content headroom (max_tokens - budget) below ~10000 without re-measuring.
+  code_review:
+    max_tokens: 12000
+    refs:               # code_review's own chain: reliable-shaped only. deepseek dropped (empties
+                        # even in isolation, exit 10) and gemini-gemma-free dropped (429 quota wall);
+                        # both stay available to spec_review/spec_judge above for re-diagnosis.
+      - spark-qwen-3-8         # primary: local, free; with deadline 2400 it gets its full 900s
+      - gemini-gemma-free
+      - openrouter-gemma-paid  # backup: paid gemma, no 429, shape parses
+  spec_review:
+    max_tokens: 12000
+
+sentry:
+  stall_window_secs: 7200

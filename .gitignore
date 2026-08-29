@@ -1,0 +1,21 @@
+node_modules/
+dist/
+*.log
+.env.claude-box
+.faffrc.local.yaml
+
+# Local-development secrets: never commit. The placeholder .env.example is committed.
+.env
+!.env.example
+
+# faff local artifacts (added by `faff gitignore-ensure`)
+.faffrc
+.faffrc.yml
+.faffrc.*.yaml
+!.faffrc.example.yaml
+.faff/*
+!.faff/anchors/
+
+.faff_run*
+
+evidence
