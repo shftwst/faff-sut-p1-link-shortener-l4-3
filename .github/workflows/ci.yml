@@ -1,0 +1,16 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: gofmt
+        run: ./scripts/ci-gofmt.sh
+      - name: go vet
+        run: docker run --rm -v "$PWD":/src -w /src -e GOTOOLCHAIN=local golang:1.22-alpine go vet ./...
+      - name: go test
+        run: docker run --rm -v "$PWD":/src -w /src -e GOTOOLCHAIN=local golang:1.22-alpine go test ./...
