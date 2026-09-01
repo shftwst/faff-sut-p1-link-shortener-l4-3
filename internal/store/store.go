@@ -74,7 +74,11 @@ func scrub(msg, dsn string) string {
 	out := strings.ReplaceAll(msg, dsn, "[redacted-dsn]")
 	if u, err := url.Parse(dsn); err == nil && u.User != nil {
 		if pw, ok := u.User.Password(); ok && pw != "" {
-			out = strings.ReplaceAll(out, pw, "[redacted]")
+			// Redact the password and its common encoded forms, so a driver
+			// error that reproduced it percent-encoded still cannot leak it.
+			for _, form := range []string{pw, url.QueryEscape(pw), url.PathEscape(pw)} {
+				out = strings.ReplaceAll(out, form, "[redacted]")
+			}
 		}
 	}
 	return out

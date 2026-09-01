@@ -39,22 +39,29 @@ func Run(dsn, dir string) (status string, err error) {
 
 	m, err := migrate.New("file://"+dir, dsn)
 	if err != nil {
-		if noMigrationFiles(dir) {
-			return "no change (empty migrations dir)", nil
-		}
+		// A genuine runner-construction failure (bad DSN, driver init, DB
+		// unreachable) must surface — never mask it just because the dir is
+		// empty.
 		return "", err
 	}
 	defer m.Close()
 
+	// Empty source is a deterministic no-op: the runner is constructed and has
+	// nothing to apply. Short-circuit here rather than calling Up() and trying to
+	// tell its "no migration files" error apart from a real failure once
+	// golang-migrate has wrapped it — that ambiguity is exactly what would let a
+	// real error be swallowed on E1's always-empty dir.
+	if noMigrationFiles(dir) {
+		return "no change (empty migrations dir)", nil
+	}
+
+	// A present, non-empty dir: apply. Only ErrNoChange is a no-op; every other
+	// error is a genuine migration failure and surfaces.
 	switch upErr := m.Up(); {
 	case upErr == nil:
 		return "applied", nil
 	case errors.Is(upErr, migrate.ErrNoChange):
 		return "no change", nil
-	case noMigrationFiles(dir):
-		// The runner ran, but the present migrations directory holds no
-		// migration files — E1's expected empty-dir no-op.
-		return "no change (empty migrations dir)", nil
 	default:
 		return "", upErr
 	}
@@ -90,7 +97,11 @@ func scrub(msg, dsn string) string {
 	out := strings.ReplaceAll(msg, dsn, "[redacted-dsn]")
 	if u, err := url.Parse(dsn); err == nil && u.User != nil {
 		if pw, ok := u.User.Password(); ok && pw != "" {
-			out = strings.ReplaceAll(out, pw, "[redacted]")
+			// Redact the password and its common encoded forms, so a driver
+			// error that reproduced it percent-encoded still cannot leak it.
+			for _, form := range []string{pw, url.QueryEscape(pw), url.PathEscape(pw)} {
+				out = strings.ReplaceAll(out, form, "[redacted]")
+			}
 		}
 	}
 	return out
