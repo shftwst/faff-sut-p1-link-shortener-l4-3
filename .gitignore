@@ -7,3 +7,6 @@ dist/
 # Local-development secrets: never commit. The placeholder .env.example is committed.
 .env
 !.env.example
+
+# built binary
+/api

@@ -1,0 +1,6 @@
+.git
+.faff
+.env
+*.md
+docs
+RUNBOOK.md
