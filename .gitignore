@@ -1,6 +1,7 @@
 node_modules/
 dist/
 *.log
+!run.log
 .env.claude-box
 .faffrc.local.yaml
 

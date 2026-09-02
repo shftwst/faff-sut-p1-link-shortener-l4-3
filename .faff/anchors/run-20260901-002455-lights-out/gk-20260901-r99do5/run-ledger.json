@@ -51,6 +51,12 @@
     "metering": {
       "source_at_mint": "transcript",
       "degraded": false
+    },
+    "tokens_at_last_event": {
+      "input": 298,
+      "output": 386024,
+      "cache_write": 1811187,
+      "cache_read": 41554549
     }
   },
   "budget_ceiling": {
@@ -78,14 +84,32 @@
     "autonomous_contract": true
   },
   "admitted": [
-    "gk-20260901-r99do5"
+    "gk-20260901-r99do5",
+    "gk-20260901-vesiuq"
   ],
-  "outcomes": {},
+  "outcomes": {
+    "gk-20260901-r99do5": "shipped",
+    "gk-20260901-vesiuq": "parked"
+  },
   "owner": {
-    "status": "running",
+    "status": "done",
     "session_id": null,
     "pid": 433,
     "started_at": "2026-09-01T00:24:55.232Z",
-    "last_heartbeat": "2026-09-01T00:24:55.232Z"
-  }
+    "last_heartbeat": "2026-09-01T07:10:01.598Z"
+  },
+  "outcome_details": {
+    "gk-20260901-vesiuq": {
+      "reason": "holdout needs-human (2/12 criteria not code-blind-verifiable at store-layer stage)",
+      "gates": "pass",
+      "review": "pass",
+      "holdout": "needs-human",
+      "punts": [
+        "S7 down-migration (never running-stack-verifiable; integration-tested)",
+        "S11 query-path DSN-free error (needs E3/E4 HTTP surface)"
+      ],
+      "root_cause": "spec-dod-vs-holdout-tiering-mismatch"
+    }
+  },
+  "stop_reason": "product-incomplete"
 }
