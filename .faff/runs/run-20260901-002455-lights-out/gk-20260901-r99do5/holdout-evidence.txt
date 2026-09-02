@@ -1,0 +1,32 @@
+S1: compose ps both healthy within 60s
+e1hold-api-1 healthy
+e1hold-db-1 healthy
+S2/S1: GET /healthz
+{"status":"ok"}
+  HTTP/1.1 200 OK
+  Content-Type: application/json
+  Date: Tue, 01 Sep 2026 04:48:33 GMT
+  Content-Length: 16
+S3: GET /does-not-exist (holdout-marked)
+{"error":{"code":"not_found","message":"resource not found"}}
+
+  HTTP/1.1 404 Not Found
+S4: POST /healthz -> 405
+{"error":{"code":"method_not_allowed","message":"method not allowed"}}
+
+  HTTP/1.1 405 Method Not Allowed
+S5: migration ran before listening (logs)
+api-1  | {"event":"migrate_done","level":"info","msg":"migration runner ran: no change (empty migrations dir)"}
+api-1  | {"event":"listening","level":"info","msg":"http server listening on :8080"}
+A1: non-root uid
+10001
+S6/A2-graceful: SIGTERM -> exit 0 within 10s
+stop wall-time: 0s ; exitcode=0
+S7-unset DATABASE_URL:
+exit=1 :: {"event":"config_invalid","level":"fatal","reason":"DATABASE_URL is required but was empty or unset"}
+S8-malformed DSN (sup3rSecret):
+exit=1 secretcount=0 :: {"event":"db_connect_failed","level":"fatal","reason":"DATABASE_URL is malformed and could not be parsed"}
+S9-unreachable DB (sup3rSecret):
+exit=1 secretcount=0 :: {"event":"db_connect_failed","level":"fatal","reason":"could not connect to the database named by DATABASE_URL: failed to connect to `host=127.0.0.1 user=user database=app`: dial error (dial tcp 127.0.0.1:1: connect: connection refused)"}
+=== teardown ===
+ Network e1hold_default Removed 

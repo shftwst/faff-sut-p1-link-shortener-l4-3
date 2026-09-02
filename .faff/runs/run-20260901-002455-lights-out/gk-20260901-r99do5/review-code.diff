@@ -1,0 +1,850 @@
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 0000000..8be2aa5
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,6 @@
++.git
++.faff
++.env
++*.md
++docs
++RUNBOOK.md
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..f271f42
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,9 @@
++# Example configuration for the link-shortener api. Copy to .env and adjust.
++# Never commit a real secret: this file documents shape only.
++
++# Postgres DSN (required). When running under docker-compose the host is the
++# `db` service; for a local run point it at your own Postgres instance.
++DATABASE_URL=postgres://linkshortener:linkshortener@db:5432/linkshortener?sslmode=disable
++
++# TCP listen address (optional; defaults to :8080).
++HTTP_ADDR=:8080
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..0f9da42
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,16 @@
++name: ci
++on:
++  pull_request:
++  push:
++    branches: [main]
++jobs:
++  build:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: gofmt
++        run: ./scripts/ci-gofmt.sh
++      - name: go vet
++        run: docker run --rm -v "$PWD":/src -w /src -e GOTOOLCHAIN=local golang:1.22-alpine go vet ./...
++      - name: go test
++        run: docker run --rm -v "$PWD":/src -w /src -e GOTOOLCHAIN=local golang:1.22-alpine go test ./...
+diff --git a/.gitignore b/.gitignore
+index 5717081..76af45b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -7,3 +7,6 @@ dist/
+ # Local-development secrets: never commit. The placeholder .env.example is committed.
+ .env
+ !.env.example
++
++# built binary
++/api
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 0000000..6891029
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,24 @@
++# Multi-stage build: compile a static Go binary, then run it in a minimal Alpine
++# image as a dedicated non-root user.
++FROM golang:1.22-alpine AS build
++WORKDIR /src
++
++# Cache module downloads independently of source changes.
++COPY go.mod go.sum ./
++RUN go mod download
++
++COPY . .
++# CGO disabled -> a static binary that runs in a minimal image with no libc deps.
++RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/api ./cmd/api
++
++FROM alpine:3.20
++# wget backs the container healthcheck; ca-certificates for TLS if ever needed.
++RUN apk add --no-cache wget ca-certificates \
++    && adduser -D -u 10001 appuser
++COPY --from=build /out/api /usr/local/bin/api
++# The (empty in E1) migrations directory the startup runner reads from /migrations.
++COPY --from=build /src/migrations /migrations
++USER appuser
++WORKDIR /
++EXPOSE 8080
++ENTRYPOINT ["/usr/local/bin/api"]
+diff --git a/cmd/api/main.go b/cmd/api/main.go
+new file mode 100644
+index 0000000..482f283
+--- /dev/null
++++ b/cmd/api/main.go
+@@ -0,0 +1,124 @@
++// Command api is the link-shortener service entrypoint. Startup is a strict,
++// fail-fast sequence: load config, connect to Postgres and Ping, run migrations,
++// then bind and serve. The HTTP port is never bound unless every prior step
++// succeeds, so a healthy api implies a reachable database.
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"net"
++	"net/http"
++	"os"
++	"os/signal"
++	"syscall"
++	"time"
++
++	"linkshortener/internal/config"
++	"linkshortener/internal/httpapi"
++	"linkshortener/internal/migrate"
++	"linkshortener/internal/store"
++)
++
++// migrationsDir is the golang-migrate source directory, resolved relative to the
++// working directory (the image WORKDIR is /, so this is /migrations).
++const migrationsDir = "migrations"
++
++// shutdownTimeout bounds the graceful drain on SIGINT/SIGTERM.
++const shutdownTimeout = 10 * time.Second
++
++func main() {
++	os.Exit(run())
++}
++
++// run performs the startup sequence and blocks serving until a shutdown signal.
++// It returns the process exit code so deferred cleanup still runs (os.Exit in
++// main would skip defers).
++func run() int {
++	// 1. Configuration. A missing/blank DATABASE_URL is fatal before any port is
++	// bound. The error names the variable and never echoes its value.
++	cfg, err := config.Load()
++	if err != nil {
++		logFatal("config_invalid", err.Error())
++		return 1
++	}
++
++	ctx := context.Background()
++
++	// 2. Database connection + Ping. On failure the port is never bound. The
++	// reason is scrubbed of the DSN so the password cannot reach the logs.
++	pool, err := store.Open(ctx, cfg.DatabaseURL)
++	if err != nil {
++		logFatal("db_connect_failed", store.SafeReason(err, cfg.DatabaseURL))
++		return 1
++	}
++	defer pool.Close()
++
++	// 3. Migrations. ErrNoChange (E1's empty migrations dir) is success. Any
++	// other error is fatal before binding; the reason is DSN-scrubbed.
++	status, err := migrate.Run(cfg.DatabaseURL, migrationsDir)
++	if err != nil {
++		logFatal("migrate_failed", migrate.SafeReason(err, cfg.DatabaseURL))
++		return 1
++	}
++	logInfo("migrate_done", "migration runner ran: "+status)
++
++	// 4/5. Bind and serve. The listener is opened only now — after config, the
++	// DB connection, and the migration runner all succeeded — so the port is
++	// never bound in a half-up state. The "listening" line is logged strictly
++	// after the migration line above.
++	mux := httpapi.NewRouter(pool)
++	srv := &http.Server{Handler: mux}
++
++	ln, err := net.Listen("tcp", cfg.HTTPAddr)
++	if err != nil {
++		logFatal("listen_failed", "could not bind "+cfg.HTTPAddr)
++		return 1
++	}
++	logInfo("listening", "http server listening on "+cfg.HTTPAddr)
++
++	serveErr := make(chan error, 1)
++	go func() {
++		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
++			serveErr <- err
++		}
++	}()
++
++	stop := make(chan os.Signal, 1)
++	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
++
++	select {
++	case err := <-serveErr:
++		logFatal("serve_failed", "http server stopped serving: "+err.Error())
++		return 1
++	case <-stop:
++		// Graceful shutdown: stop accepting new connections and drain in-flight
++		// requests within the bounded timeout, then exit 0.
++		logInfo("shutdown", "signal received, draining connections")
++		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
++		defer cancel()
++		if err := srv.Shutdown(shutdownCtx); err != nil {
++			logInfo("shutdown_forced", "drain did not complete within timeout")
++		}
++		return 0
++	}
++}
++
++// logFatal writes a single-line JSON fatal record to stderr. reason must never
++// contain a secret; callers pass DSN-scrubbed strings.
++func logFatal(event, reason string) {
++	writeLine(os.Stderr, map[string]string{"level": "fatal", "event": event, "reason": reason})
++}
++
++// logInfo writes a single-line JSON info record to stdout.
++func logInfo(event, msg string) {
++	writeLine(os.Stdout, map[string]string{"level": "info", "event": event, "msg": msg})
++}
++
++func writeLine(w *os.File, rec map[string]string) {
++	b, err := json.Marshal(rec)
++	if err != nil {
++		return
++	}
++	_, _ = w.Write(append(b, '\n'))
++}
+diff --git a/docker-compose.yml b/docker-compose.yml
+new file mode 100644
+index 0000000..f243576
+--- /dev/null
++++ b/docker-compose.yml
+@@ -0,0 +1,33 @@
++# Two-service topology: the api and its Postgres 16 datastore, each health-checked.
++# `docker compose up -d --build` brings both to healthy well within 60 seconds.
++services:
++  db:
++    image: postgres:16
++    environment:
++      POSTGRES_USER: linkshortener
++      POSTGRES_PASSWORD: linkshortener
++      POSTGRES_DB: linkshortener
++    healthcheck:
++      test: ["CMD-SHELL", "pg_isready -U linkshortener -d linkshortener"]
++      interval: 3s
++      timeout: 3s
++      retries: 15
++      start_period: 5s
++
++  api:
++    build: .
++    environment:
++      DATABASE_URL: postgres://linkshortener:linkshortener@db:5432/linkshortener?sslmode=disable
++      HTTP_ADDR: ":8080"
++    depends_on:
++      db:
++        condition: service_healthy
++    ports:
++      - "8080:8080"
++    restart: on-failure
++    healthcheck:
++      test: ["CMD-SHELL", "wget -q -O - http://localhost:8080/healthz || exit 1"]
++      interval: 3s
++      timeout: 3s
++      retries: 15
++      start_period: 3s
+diff --git a/go.mod b/go.mod
+new file mode 100644
+index 0000000..34e2cb3
+--- /dev/null
++++ b/go.mod
+@@ -0,0 +1,23 @@
++module linkshortener
++
++go 1.22.0
++
++toolchain go1.22.12
++
++require (
++	github.com/golang-migrate/migrate/v4 v4.18.1
++	github.com/jackc/pgx/v5 v5.5.4
++)
++
++require (
++	github.com/hashicorp/errwrap v1.1.0 // indirect
++	github.com/hashicorp/go-multierror v1.1.1 // indirect
++	github.com/jackc/pgpassfile v1.0.0 // indirect
++	github.com/jackc/pgservicefile v0.0.0-20221227161230-091c0ba34f0a // indirect
++	github.com/jackc/puddle/v2 v2.2.1 // indirect
++	github.com/lib/pq v1.10.9 // indirect
++	go.uber.org/atomic v1.7.0 // indirect
++	golang.org/x/crypto v0.27.0 // indirect
++	golang.org/x/sync v0.8.0 // indirect
++	golang.org/x/text v0.18.0 // indirect
++)
+diff --git a/internal/config/config.go b/internal/config/config.go
+new file mode 100644
+index 0000000..4ec1f62
+--- /dev/null
++++ b/internal/config/config.go
+@@ -0,0 +1,42 @@
++// Package config reads and validates the service configuration from the
++// environment at startup. It never returns the value of a secret (such as the
++// database password embedded in DATABASE_URL) in an error: a validation failure
++// names the offending variable, it does not echo its value.
++package config
++
++import (
++	"errors"
++	"os"
++)
++
++// DefaultHTTPAddr is the listen address used when HTTP_ADDR is unset.
++const DefaultHTTPAddr = ":8080"
++
++// Config is the immutable, validated configuration read once at startup.
++type Config struct {
++	// DatabaseURL is the Postgres DSN. Required.
++	DatabaseURL string
++	// HTTPAddr is the TCP listen address. Defaults to DefaultHTTPAddr.
++	HTTPAddr string
++}
++
++// ErrMissingDatabaseURL is returned when DATABASE_URL is absent or blank. Its
++// text names the variable only and never contains a value.
++var ErrMissingDatabaseURL = errors.New("DATABASE_URL is required but was empty or unset")
++
++// Load reads the configuration from the process environment and validates it.
++// A missing or blank DATABASE_URL is a fatal configuration error. The returned
++// error is safe to log: it never contains the value of any environment variable.
++func Load() (Config, error) {
++	cfg := Config{
++		DatabaseURL: os.Getenv("DATABASE_URL"),
++		HTTPAddr:    os.Getenv("HTTP_ADDR"),
++	}
++	if cfg.HTTPAddr == "" {
++		cfg.HTTPAddr = DefaultHTTPAddr
++	}
++	if cfg.DatabaseURL == "" {
++		return Config{}, ErrMissingDatabaseURL
++	}
++	return cfg, nil
++}
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+new file mode 100644
+index 0000000..03af763
+--- /dev/null
++++ b/internal/config/config_test.go
+@@ -0,0 +1,46 @@
++package config
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestLoadMissingDatabaseURL(t *testing.T) {
++	t.Setenv("DATABASE_URL", "")
++	t.Setenv("HTTP_ADDR", "")
++	_, err := Load()
++	if err == nil {
++		t.Fatal("expected an error when DATABASE_URL is unset, got nil")
++	}
++	// The error must name the variable but never echo a value.
++	if !strings.Contains(err.Error(), "DATABASE_URL") {
++		t.Fatalf("error should name DATABASE_URL, got %q", err.Error())
++	}
++}
++
++func TestLoadDefaultsHTTPAddr(t *testing.T) {
++	t.Setenv("DATABASE_URL", "postgres://u:p@db:5432/x?sslmode=disable")
++	t.Setenv("HTTP_ADDR", "")
++	cfg, err := Load()
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if cfg.HTTPAddr != DefaultHTTPAddr {
++		t.Fatalf("HTTPAddr = %q, want %q", cfg.HTTPAddr, DefaultHTTPAddr)
++	}
++}
++
++func TestLoadHonoursHTTPAddr(t *testing.T) {
++	t.Setenv("DATABASE_URL", "postgres://u:p@db:5432/x?sslmode=disable")
++	t.Setenv("HTTP_ADDR", ":9090")
++	cfg, err := Load()
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if cfg.HTTPAddr != ":9090" {
++		t.Fatalf("HTTPAddr = %q, want :9090", cfg.HTTPAddr)
++	}
++	if cfg.DatabaseURL == "" {
++		t.Fatal("DatabaseURL should be populated")
++	}
++}
+diff --git a/internal/httpapi/router.go b/internal/httpapi/router.go
+new file mode 100644
+index 0000000..f6fcea8
+--- /dev/null
++++ b/internal/httpapi/router.go
+@@ -0,0 +1,65 @@
++// Package httpapi wires the HTTP surface for the service: the /healthz liveness
++// handler and a structured JSON error envelope used by the 404 and 405
++// fallbacks. Later epics register the product routes on this same router.
++package httpapi
++
++import (
++	"encoding/json"
++	"net/http"
++
++	"github.com/jackc/pgx/v5/pgxpool"
++)
++
++// ErrorResponse is the structured error envelope every non-2xx response the
++// service originates uses. The message is human-readable and safe to surface: it
++// carries no internal detail or secrets.
++type ErrorResponse struct {
++	Error ErrorBody `json:"error"`
++}
++
++// ErrorBody is the inner payload of ErrorResponse.
++type ErrorBody struct {
++	// Code is a stable, machine-readable token, e.g. "not_found".
++	Code string `json:"code"`
++	// Message is human-readable and safe to surface.
++	Message string `json:"message"`
++}
++
++// NewRouter builds the service router. The pool is held for the health surface
++// and for the repositories later epics attach; E1's handlers do not query it.
++func NewRouter(pool *pgxpool.Pool) http.Handler {
++	mux := http.NewServeMux()
++
++	// /healthz is defined for GET only. Registering the bare path (rather than a
++	// method-scoped pattern) lets us return the structured 405 envelope for a
++	// wrong method instead of the ServeMux default plain-text body.
++	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodGet {
++			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
++			return
++		}
++		healthz(w, r)
++	})
++
++	// Catch-all: any path not matched above is a structured 404.
++	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
++		writeError(w, http.StatusNotFound, "not_found", "resource not found")
++	})
++
++	return mux
++}
++
++// healthz is the shallow liveness handler. Reaching it already implies config,
++// the database connection, and migrations succeeded at boot.
++func healthz(w http.ResponseWriter, _ *http.Request) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(http.StatusOK)
++	_, _ = w.Write([]byte(`{"status":"ok"}` + "\n"))
++}
++
++// writeError emits the structured JSON error envelope with the given status.
++func writeError(w http.ResponseWriter, status int, code, message string) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	_ = json.NewEncoder(w).Encode(ErrorResponse{Error: ErrorBody{Code: code, Message: message}})
++}
+diff --git a/internal/httpapi/router_test.go b/internal/httpapi/router_test.go
+new file mode 100644
+index 0000000..624c0e2
+--- /dev/null
++++ b/internal/httpapi/router_test.go
+@@ -0,0 +1,68 @@
++package httpapi
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++func TestHealthzOK(t *testing.T) {
++	rr := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
++	NewRouter(nil).ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusOK {
++		t.Fatalf("status = %d, want 200", rr.Code)
++	}
++	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
++		t.Fatalf("Content-Type = %q, want application/json", ct)
++	}
++	if got := strings.TrimSpace(rr.Body.String()); got != `{"status":"ok"}` {
++		t.Fatalf("body = %q, want {\"status\":\"ok\"}", got)
++	}
++}
++
++func TestUndefinedRouteReturns404Envelope(t *testing.T) {
++	rr := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodGet, "/does-not-exist", nil)
++	NewRouter(nil).ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusNotFound {
++		t.Fatalf("status = %d, want 404", rr.Code)
++	}
++	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
++		t.Fatalf("Content-Type = %q, want application/json", ct)
++	}
++	var body ErrorResponse
++	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
++		t.Fatalf("body is not JSON: %v", err)
++	}
++	if body.Error.Code != "not_found" {
++		t.Fatalf("error.code = %q, want not_found", body.Error.Code)
++	}
++	if body.Error.Message == "" {
++		t.Fatal("error.message should be non-empty")
++	}
++}
++
++func TestWrongMethodReturns405Envelope(t *testing.T) {
++	rr := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodPost, "/healthz", nil)
++	NewRouter(nil).ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusMethodNotAllowed {
++		t.Fatalf("status = %d, want 405", rr.Code)
++	}
++	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
++		t.Fatalf("Content-Type = %q, want application/json", ct)
++	}
++	var body ErrorResponse
++	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
++		t.Fatalf("body is not JSON: %v", err)
++	}
++	if body.Error.Code != "method_not_allowed" {
++		t.Fatalf("error.code = %q, want method_not_allowed", body.Error.Code)
++	}
++}
+diff --git a/internal/migrate/migrate.go b/internal/migrate/migrate.go
+new file mode 100644
+index 0000000..a6a3143
+--- /dev/null
++++ b/internal/migrate/migrate.go
+@@ -0,0 +1,108 @@
++// Package migrate wraps the golang-migrate runner the api invokes at startup.
++// It applies all pending migrations to the latest version before the server
++// binds. E1 ships an empty migrations directory, so the runner finds nothing to
++// apply, which is treated as success.
++//
++// Errors are scrubbed of the DSN: golang-migrate wraps the underlying driver
++// error, which can embed the connection string, so callers must log
++// SafeReason(err, dsn) rather than err.Error() verbatim.
++package migrate
++
++import (
++	"errors"
++	"fmt"
++	"net/url"
++	"os"
++	"strings"
++
++	"github.com/golang-migrate/migrate/v4"
++	// Postgres database driver and file source, registered via blank import.
++	_ "github.com/golang-migrate/migrate/v4/database/postgres"
++	_ "github.com/golang-migrate/migrate/v4/source/file"
++)
++
++// Run applies all pending migrations found under dir against the database named
++// by dsn. It returns a short human-readable status ("applied" or a "no change"
++// variant) and an error.
++//
++// Two non-error cases both mean "nothing to apply": golang-migrate's ErrNoChange
++// (migration files exist but none are pending) and a present-but-empty
++// migrations directory (E1 ships no migration files, for which the file source
++// reports "file does not exist"). A genuinely missing directory, or a real
++// migration failure when migration files are present, is a hard error.
++func Run(dsn, dir string) (status string, err error) {
++	// A missing migrations directory is a real misconfiguration; only a present
++	// but empty directory is E1's expected no-op.
++	if fi, statErr := os.Stat(dir); statErr != nil || !fi.IsDir() {
++		return "", fmt.Errorf("migrations directory %q is not present", dir)
++	}
++
++	m, err := migrate.New("file://"+dir, dsn)
++	if err != nil {
++		// A genuine runner-construction failure (bad DSN, driver init, DB
++		// unreachable) must surface — never mask it just because the dir is
++		// empty.
++		return "", err
++	}
++	defer m.Close()
++
++	// Empty source is a deterministic no-op: the runner is constructed and has
++	// nothing to apply. Short-circuit here rather than calling Up() and trying to
++	// tell its "no migration files" error apart from a real failure once
++	// golang-migrate has wrapped it — that ambiguity is exactly what would let a
++	// real error be swallowed on E1's always-empty dir.
++	if noMigrationFiles(dir) {
++		return "no change (empty migrations dir)", nil
++	}
++
++	// A present, non-empty dir: apply. Only ErrNoChange is a no-op; every other
++	// error is a genuine migration failure and surfaces.
++	switch upErr := m.Up(); {
++	case upErr == nil:
++		return "applied", nil
++	case errors.Is(upErr, migrate.ErrNoChange):
++		return "no change", nil
++	default:
++		return "", upErr
++	}
++}
++
++// noMigrationFiles reports whether dir contains no *.sql migration files.
++func noMigrationFiles(dir string) bool {
++	entries, err := os.ReadDir(dir)
++	if err != nil {
++		return false
++	}
++	for _, e := range entries {
++		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
++			return false
++		}
++	}
++	return true
++}
++
++// SafeReason returns a secret-free reason string for a migration error, with any
++// DSN or password substring redacted from the wrapped driver error text.
++func SafeReason(err error, dsn string) string {
++	if err == nil {
++		return ""
++	}
++	return "migration runner failed: " + scrub(err.Error(), dsn)
++}
++
++func scrub(msg, dsn string) string {
++	if dsn == "" {
++		return msg
++	}
++	out := strings.ReplaceAll(msg, dsn, "[redacted-dsn]")
++	if u, err := url.Parse(dsn); err == nil && u.User != nil {
++		if pw, ok := u.User.Password(); ok && pw != "" {
++			// Redact the password and its common encoded forms, so a driver
++			// error that reproduced it percent-encoded still cannot leak it.
++			for _, form := range []string{pw, url.QueryEscape(pw), url.PathEscape(pw)} {
++				out = strings.ReplaceAll(out, form, "[redacted]")
++			}
++		}
++	}
++	return out
++}
+diff --git a/internal/migrate/migrate_test.go b/internal/migrate/migrate_test.go
+new file mode 100644
+index 0000000..df6baa8
+--- /dev/null
++++ b/internal/migrate/migrate_test.go
+@@ -0,0 +1,47 @@
++package migrate
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func TestRunMissingDirIsError(t *testing.T) {
++	// A missing migrations directory is a real misconfiguration and must error
++	// before any database contact.
++	_, err := Run("postgres://u:p@localhost:1/none?sslmode=disable", filepath.Join(t.TempDir(), "nope"))
++	if err == nil {
++		t.Fatal("expected an error for a missing migrations directory")
++	}
++	if !strings.Contains(err.Error(), "not present") {
++		t.Fatalf("error should mention the directory is not present, got %q", err.Error())
++	}
++}
++
++func TestNoMigrationFiles(t *testing.T) {
++	empty := t.TempDir()
++	if !noMigrationFiles(empty) {
++		t.Fatal("empty dir should report no migration files")
++	}
++
++	withSQL := t.TempDir()
++	if err := os.WriteFile(filepath.Join(withSQL, "0001_init.up.sql"), []byte("SELECT 1;"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if noMigrationFiles(withSQL) {
++		t.Fatal("dir with a .sql file should report migration files present")
++	}
++}
++
++func TestSafeReasonScrubsDSN(t *testing.T) {
++	dsn := "postgres://user:sup3rSecret@db:5432/app?sslmode=disable"
++	reason := SafeReason(errString("failed: "+dsn), dsn)
++	if strings.Contains(reason, "sup3rSecret") || strings.Contains(reason, dsn) {
++		t.Fatalf("reason leaked the DSN/password: %q", reason)
++	}
++}
++
++type errString string
++
++func (e errString) Error() string { return string(e) }
+diff --git a/internal/store/store.go b/internal/store/store.go
+new file mode 100644
+index 0000000..d4d60eb
+--- /dev/null
++++ b/internal/store/store.go
+@@ -0,0 +1,85 @@
++// Package store owns the Postgres connection foundation: it constructs a
++// pgxpool and confirms connectivity with a single Ping at startup. It exposes
++// no queries yet; the links repository lands in a later epic.
++//
++// Every error this package surfaces is scrubbed of the DSN. A raw pgx parse or
++// connection error frequently embeds the connection string (host, user, and
++// password), so callers must log SafeReason(err, dsn), never err.Error()
++// verbatim.
++package store
++
++import (
++	"context"
++	"net/url"
++	"strings"
++	"time"
++
++	"github.com/jackc/pgx/v5/pgxpool"
++)
++
++// connectTimeout bounds the parse+connect+ping sequence at startup.
++const connectTimeout = 10 * time.Second
++
++// parseError marks a failure to parse the DSN. The underlying pgx parse error is
++// deliberately discarded because it can echo the DSN verbatim.
++type parseError struct{}
++
++func (parseError) Error() string { return "DATABASE_URL is malformed and could not be parsed" }
++
++// Open parses the DSN, constructs a pgxpool, and Pings once to confirm the
++// database is reachable. On any failure it returns an error that is safe to pass
++// to SafeReason for logging.
++func Open(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
++	poolCfg, err := pgxpool.ParseConfig(dsn)
++	if err != nil {
++		return nil, parseError{}
++	}
++
++	ctx, cancel := context.WithTimeout(ctx, connectTimeout)
++	defer cancel()
++
++	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
++	if err != nil {
++		return nil, err
++	}
++	if err := pool.Ping(ctx); err != nil {
++		pool.Close()
++		return nil, err
++	}
++	return pool, nil
++}
++
++// SafeReason returns a stable, secret-free reason string for a store error. It
++// never contains the DSN or its password. When the error is not a known parse
++// failure it redacts any DSN or password substring from the driver error text
++// before returning it, so a wrapped pgx error can never leak the connection
++// string into the logs.
++func SafeReason(err error, dsn string) string {
++	if err == nil {
++		return ""
++	}
++	if _, ok := err.(parseError); ok {
++		return err.Error()
++	}
++	return "could not connect to the database named by DATABASE_URL: " + scrub(err.Error(), dsn)
++}
++
++// scrub removes the DSN and its password from a message. It replaces the whole
++// DSN string first, then the parsed password (in case the driver reconstructed
++// or partially quoted the connection string).
++func scrub(msg, dsn string) string {
++	if dsn == "" {
++		return msg
++	}
++	out := strings.ReplaceAll(msg, dsn, "[redacted-dsn]")
++	if u, err := url.Parse(dsn); err == nil && u.User != nil {
++		if pw, ok := u.User.Password(); ok && pw != "" {
++			// Redact the password and its common encoded forms, so a driver
++			// error that reproduced it percent-encoded still cannot leak it.
++			for _, form := range []string{pw, url.QueryEscape(pw), url.PathEscape(pw)} {
++				out = strings.ReplaceAll(out, form, "[redacted]")
++			}
++		}
++	}
++	return out
++}
+diff --git a/internal/store/store_test.go b/internal/store/store_test.go
+new file mode 100644
+index 0000000..5a62df6
+--- /dev/null
++++ b/internal/store/store_test.go
+@@ -0,0 +1,34 @@
++package store
++
++import (
++	"strings"
++	"testing"
++)
++
++// A recognisable password token used to prove it is never surfaced in a reason.
++const secretToken = "sup3rSecret"
++
++func TestSafeReasonScrubsPasswordFromDriverError(t *testing.T) {
++	dsn := "postgres://user:" + secretToken + "@db:5432/app?sslmode=disable"
++	// Simulate a wrapped driver error that embedded the whole DSN.
++	drvErr := errString("dial error connecting with " + dsn)
++	reason := SafeReason(drvErr, dsn)
++	if strings.Contains(reason, secretToken) {
++		t.Fatalf("reason leaked the password token: %q", reason)
++	}
++	if strings.Contains(reason, dsn) {
++		t.Fatalf("reason leaked the raw DSN: %q", reason)
++	}
++}
++
++func TestSafeReasonParseErrorHasNoValue(t *testing.T) {
++	dsn := "not://a valid dsn:" + secretToken + "@"
++	reason := SafeReason(parseError{}, dsn)
++	if strings.Contains(reason, secretToken) {
++		t.Fatalf("parse-error reason leaked the token: %q", reason)
++	}
++}
++
++type errString string
++
++func (e errString) Error() string { return string(e) }
+diff --git a/migrations/.gitkeep b/migrations/.gitkeep
+new file mode 100644
+index 0000000..e69de29
+diff --git a/scripts/ci-gofmt.sh b/scripts/ci-gofmt.sh
+new file mode 100755
+index 0000000..cfbca57
+--- /dev/null
++++ b/scripts/ci-gofmt.sh
+@@ -0,0 +1,10 @@
++#!/usr/bin/env bash
++# Fail if any Go source is not gofmt-clean. Runs gofmt in the pinned Go image.
++set -euo pipefail
++unformatted=$(docker run --rm -v "$PWD":/src -w /src -e GOTOOLCHAIN=local golang:1.22-alpine gofmt -l .)
++if [ -n "$unformatted" ]; then
++  echo "gofmt: the following files are not formatted:"
++  echo "$unformatted"
++  exit 1
++fi
++echo "gofmt: clean"

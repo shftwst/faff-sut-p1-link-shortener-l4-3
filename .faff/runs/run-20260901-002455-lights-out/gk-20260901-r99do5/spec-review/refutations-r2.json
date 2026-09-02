@@ -1,0 +1,61 @@
+[
+  {
+    "lens": "architectural",
+    "outcome": "refuted",
+    "objections": [
+      {
+        "severity": "major",
+        "claim": "the spec's method for proving the migration runner is functional is logically impossible given the defined state of the repository.",
+        "evidence": "section 2 states \"E1 ships the migration runner and an empty `migrations/` directory\"; section 4 and section 5 (scenarios) assert that the presence of the `schema_migrations` table in the database is the observable proof that the runner executed.",
+        "predicted_consequence": "the integration smoke test (step 6) will fail. `golang-migrate` does not create the `schema_migrations` bookkeeping table if no migration files are present to be applied; it simply returns `ErrNoChange`.",
+        "spec_anchor": "how-behaviour"
+      }
+    ],
+    "model": "gemini/models/gemma-4-31b-it"
+  },
+  {
+    "lens": "infosec",
+    "outcome": "unavailable",
+    "kind": "infra-configured",
+    "objections": [],
+    "model": "gemini 429 + degenerate empty (2 retries exhausted)"
+  },
+  {
+    "lens": "methodology",
+    "outcome": "clear",
+    "objections": [
+      {
+        "severity": "observation"
+      }
+    ],
+    "model": "openai/unsloth/Qwen3.8-27B-NVFP4"
+  },
+  {
+    "lens": "QA",
+    "outcome": "refuted",
+    "objections": [
+      {
+        "severity": "major",
+        "claim": "The spec cannot verify that a *present-but-invalid* DSN is not leaked into the logs.",
+        "evidence": "The `Configuration` section explicitly requires that \"a present-but-invalid DSN is reported by NAMING the offending variable... never by echoing the value,\" and the DONE criteria repeat that \"no fatal (or any) boot log contains the value of DATABASE_URL.\" However, the only corresponding scenario (the holdout) tests the case where `DATABASE_URL` is **unset**.",
+        "predicted_consequence": "A build could satisfy the \"unset\" scenario while still echoing the DSN value when the DSN is malformed (e.g., invalid syntax), leaking the database password into the logs in production.",
+        "spec_anchor": "configuration-read-from-the-environment-at-startup"
+      },
+      {
+        "severity": "minor",
+        "claim": "There is no scenario to verify the runtime user identity.",
+        "evidence": "The DONE criteria require that the \"final image runs the api as a dedicated non-root user,\" but no scenario in the `Scenarios` section asserts this (e.g., via `docker exec whoami` or image inspection).",
+        "predicted_consequence": "The build could run as root, satisfying all named scenarios while failing a core \"production-shaped\" DONE criterion.",
+        "spec_anchor": "filesystem-package-layout"
+      },
+      {
+        "severity": "minor",
+        "claim": "The assertion \"without binding the HTTP port\" lacks a concrete observation method.",
+        "evidence": "The holdout scenario asserts that the process \"exits non-zero without binding the HTTP port.\"",
+        "predicted_consequence": "It is unclear how a tester verifies the port was *never* bound. If the process binds the port and then crashes 10ms later, a simple \"exit non-zero\" check passes, but the \"without binding\" requirement is violated. The spec needs to define the oracle (e.g., \"attempting to connect to the port during the boot failure window results in connection refused\").",
+        "spec_anchor": "startup-sequence-the-api-entrypoint"
+      }
+    ],
+    "model": "gemini/models/gemma-4-31b-it"
+  }
+]

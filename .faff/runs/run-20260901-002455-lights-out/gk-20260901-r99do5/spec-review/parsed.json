@@ -1,0 +1,82 @@
+[
+  {
+    "lens": "architectural",
+    "outcome": "unavailable",
+    "kind": "infra-configured",
+    "objections": [],
+    "model": "unknown"
+  },
+  {
+    "lens": "infosec",
+    "outcome": "refuted",
+    "objections": [
+      {
+        "severity": "major",
+        "claim": "The spec requires the API to \"log a structured fatal message\" and exit when the `DATABASE_URL` is missing or invalid. Because `DATABASE_URL` is a DSN containing a plaintext password, there is a high risk that the \"structured message\" will include the invalid value for debugging purposes, leaking database credentials into the container logs (stdout/stderr). While the spec explicitly forbids secrets in *HTTP* error responses, it provides no such constraint for *internal logs*.",
+        "evidence": "Section 3 (Configuration) states: \"A missing/blank database_url is a fatal config error — the process logs a structured message and exits non-zero\". Section 4 (Startup sequence) repeats: \"IF cfg invalid... log a structured fatal message; EXIT non-zero.\"",
+        "predicted_consequence": "Database credentials are persisted in plaintext within log aggregation systems or container runtime logs.",
+        "spec_anchor": "configuration-read-from-the-environment-at-startup",
+        "summary": "Secret leakage via fatal configuration logs"
+      },
+      {
+        "severity": "minor",
+        "claim": "The spec defines a multi-stage Dockerfile for a \"minimal runtime image\" but does not specify the use of a non-root user. By default, Go binaries in minimal images (like `scratch` or `alpine`) run as root unless a user is explicitly created and switched to.",
+        "evidence": "Section 3 (Filesystem / package layout) describes the `Dockerfile` as \"multi-stage: build static Go binary $\\rightarrow$ minimal runtime image\".",
+        "predicted_consequence": "Increased blast radius; any future vulnerability leading to remote code execution (RCE) in the API would grant the attacker root privileges within the container.",
+        "spec_anchor": "filesystem-package-layout",
+        "summary": "Excessive privilege in runtime container"
+      }
+    ],
+    "model": "gemini/models/gemma-4-31b-it"
+  },
+  {
+    "lens": "methodology",
+    "outcome": "clear",
+    "objections": [
+      {
+        "severity": "observation",
+        "summary": "no findings"
+      }
+    ],
+    "model": "openai/unsloth/Qwen3.8-27B-NVFP4"
+  },
+  {
+    "lens": "QA",
+    "outcome": "refuted",
+    "objections": [
+      {
+        "severity": "major",
+        "claim": "There is no observable criterion to determine if a shutdown is \"graceful\" or if it happened at all.",
+        "evidence": "The DONE item \"SIGINT/SIGTERM triggers a graceful HTTP shutdown\" has no corresponding scenario in section 5.",
+        "predicted_consequence": "A build that simply crashes or is killed instantly by Docker will satisfy the spec, as there is no test asserting the handling of signals or the closing of listeners.",
+        "spec_anchor": "done-from-how-behaviour",
+        "summary": "Graceful shutdown is unverifiable"
+      },
+      {
+        "severity": "major",
+        "claim": "The spec asserts the migration runner must execute, but the acceptance scenarios only check the HTTP surface.",
+        "evidence": "The DONE item \"golang-migrate's `schema_migrations` bookkeeping table is present in the db after `up`\" is not covered by any scenario in section 5.",
+        "predicted_consequence": "A developer could hardcode `GET /healthz` to return 200 without actually implementing the migration runner, and the build would pass all formal scenarios.",
+        "spec_anchor": "done-from-how-behaviour",
+        "summary": "Migration runner success is not asserted"
+      },
+      {
+        "severity": "minor",
+        "claim": "The spec requires a structured error for wrong methods, but provides no scenario to verify it.",
+        "evidence": "The DONE item \"A structured error envelope... is used by the 404 (and 405) fallback\" is only partially covered (404 is in the holdout scenario; 405 is missing).",
+        "predicted_consequence": "The 405 handler may be missing or return a non-structured response (e.g., plain text) without failing the build.",
+        "spec_anchor": "done-from-what-http-surface-errors",
+        "summary": "Missing scenario for 405 Method Not Allowed"
+      },
+      {
+        "severity": "minor",
+        "claim": "The term \"structured fatal log\" is vague and lacks a pass/fail definition.",
+        "evidence": "The DONE item \"A missing/blank `DATABASE_URL` causes a structured fatal log...\"",
+        "predicted_consequence": "It is impossible to decide if a log is \"structured\" (e.g., does it require JSON? A specific key-value format? Or just a formatted string?).",
+        "spec_anchor": "done-from-what-config",
+        "summary": "\"Structured\" log is undefined"
+      }
+    ],
+    "model": "gemini/models/gemma-4-31b-it"
+  }
+]

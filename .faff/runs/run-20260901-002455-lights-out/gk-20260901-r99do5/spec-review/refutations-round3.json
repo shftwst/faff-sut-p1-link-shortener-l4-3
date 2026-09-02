@@ -1,0 +1,31 @@
+[
+  {
+    "lens": "architectural",
+    "outcome": "clear",
+    "objections": [],
+    "model": "gemini non-findings (clean pass)"
+  },
+  {
+    "lens": "infosec",
+    "outcome": "clear",
+    "objections": [],
+    "model": "gemini non-findings (clean pass)"
+  },
+  {
+    "lens": "methodology",
+    "outcome": "clear",
+    "objections": [
+      {
+        "severity": "observation",
+        "claim": "no methodology signal available"
+      }
+    ],
+    "model": "gemini non-findings"
+  },
+  {
+    "lens": "QA",
+    "outcome": "clear",
+    "objections": [],
+    "model": "gemini non-findings (clean pass)"
+  }
+]

@@ -1,0 +1,10 @@
+[
+  { "lens": "architectural", "outcome": "clear", "objections": [], "model": "openai/google/gemma-4-31b-it" },
+  { "lens": "infosec", "outcome": "clear", "objections": [], "model": "openai/deepseek/deepseek-v4-flash-0731" },
+  { "lens": "methodology", "outcome": "clear", "objections": [], "model": "openai/unsloth/Qwen3.8-27B-NVFP4" },
+  { "lens": "QA", "outcome": "refuted", "model": "openai/google/gemma-4-31b-it", "objections": [
+    { "severity": "major", "claim": "down.sql correctness unverifiable — no scenario runs the down migration", "predicted_consequence": "invalid down.sql ships passing file-exists but failing functionally", "spec_anchor": "done-definition-of-done", "summary": "down.sql correctness unverifiable" },
+    { "severity": "minor", "claim": "Code/URL required-non-empty not testable (schema only NOT NULL)", "predicted_consequence": "empty strings persist, violating the record's stated constraint", "spec_anchor": "types-the-store-surface-added-to-internal-store", "summary": "non-empty constraints not verified" },
+    { "severity": "minor", "claim": "code alphabet/length boundaries not exercised", "predicted_consequence": "UTF-8 or long-value encoding issues uncaught", "spec_anchor": "types-the-store-surface-added-to-internal-store", "summary": "alphabet/length not exercised" }
+  ] }
+]

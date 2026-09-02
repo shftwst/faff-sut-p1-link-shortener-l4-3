@@ -1,0 +1,1 @@
+{"provider":"openai","model":"unsloth/Qwen3.8-27B-NVFP4","host":"https://spark.longhair-escalator.ts.net/qwen-3-8/v1","api_key_env":"DUMMY_API_KEY","reasoning_extra":{"thinking_token_budget":2000},"first_byte_timeout":180}

@@ -1,0 +1,14 @@
+{
+  "issue": "gk-20260901-vesiuq",
+  "phase1": {
+    "status": "done",
+    "verdict": "pass",
+    "diff_hash": "9a82200d61fb1abe241affd098083c9172dd7aec75eedbedf37f986c05f691ad"
+  },
+  "phase2": {
+    "status": "complete",
+    "attempts": 0,
+    "findings_ref": "/tmp/e2-phase2-out.txt"
+  },
+  "updated_at": "2026-09-01T06:54:20.427Z"
+}

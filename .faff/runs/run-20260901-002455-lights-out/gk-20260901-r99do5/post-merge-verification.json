@@ -1,0 +1,10 @@
+{
+  "issue": "gk-20260901-r99do5",
+  "pr": 0,
+  "merge_sha": "da01a8a18742a854d3643a3491adb521a4980086",
+  "verdict": "verified-ok",
+  "basis": "docker run --rm -v \"$PWD\":/src -w /src -e GOTOOLCHAIN=local golang:1.22-alpine go test ./... exit 0",
+  "command": "docker run --rm -v \"$PWD\":/src -w /src -e GOTOOLCHAIN=local golang:1.22-alpine go test ./...",
+  "discovered_scope_ref": null,
+  "checked_at": "2026-09-01T04:55:02.871Z"
+}

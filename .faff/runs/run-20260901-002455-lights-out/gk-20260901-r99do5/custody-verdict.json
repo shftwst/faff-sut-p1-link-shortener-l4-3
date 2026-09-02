@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "run_id": "run-20260901-002455-lights-out",
+  "issue": "gk-20260901-r99do5",
+  "verified_at": "2026-09-01T04:50:52.102Z",
+  "merge_state_at_verification": "pre-merge",
+  "classification": "clean",
+  "paths": [],
+  "detail": "digest-verified — no diffs against the held manifest"
+}

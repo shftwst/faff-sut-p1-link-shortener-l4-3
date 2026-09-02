@@ -1,0 +1,1299 @@
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 0000000..8be2aa5
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,6 @@
++.git
++.faff
++.env
++*.md
++docs
++RUNBOOK.md
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..f271f42
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,9 @@
++# Example configuration for the link-shortener api. Copy to .env and adjust.
++# Never commit a real secret: this file documents shape only.
++
++# Postgres DSN (required). When running under docker-compose the host is the
++# `db` service; for a local run point it at your own Postgres instance.
++DATABASE_URL=postgres://linkshortener:linkshortener@db:5432/linkshortener?sslmode=disable
++
++# TCP listen address (optional; defaults to :8080).
++HTTP_ADDR=:8080
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..0f9da42
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,16 @@
++name: ci
++on:
++  pull_request:
++  push:
++    branches: [main]
++jobs:
++  build:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: gofmt
++        run: ./scripts/ci-gofmt.sh
++      - name: go vet
++        run: docker run --rm -v "$PWD":/src -w /src -e GOTOOLCHAIN=local golang:1.22-alpine go vet ./...
++      - name: go test
++        run: docker run --rm -v "$PWD":/src -w /src -e GOTOOLCHAIN=local golang:1.22-alpine go test ./...
+diff --git a/.gitignore b/.gitignore
+index 5717081..76af45b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -7,3 +7,6 @@ dist/
+ # Local-development secrets: never commit. The placeholder .env.example is committed.
+ .env
+ !.env.example
++
++# built binary
++/api
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 0000000..6891029
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,24 @@
++# Multi-stage build: compile a static Go binary, then run it in a minimal Alpine
++# image as a dedicated non-root user.
++FROM golang:1.22-alpine AS build
++WORKDIR /src
++
++# Cache module downloads independently of source changes.
++COPY go.mod go.sum ./
++RUN go mod download
++
++COPY . .
++# CGO disabled -> a static binary that runs in a minimal image with no libc deps.
++RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/api ./cmd/api
++
++FROM alpine:3.20
++# wget backs the container healthcheck; ca-certificates for TLS if ever needed.
++RUN apk add --no-cache wget ca-certificates \
++    && adduser -D -u 10001 appuser
++COPY --from=build /out/api /usr/local/bin/api
++# The (empty in E1) migrations directory the startup runner reads from /migrations.
++COPY --from=build /src/migrations /migrations
++USER appuser
++WORKDIR /
++EXPOSE 8080
++ENTRYPOINT ["/usr/local/bin/api"]
+diff --git a/cmd/api/main.go b/cmd/api/main.go
+new file mode 100644
+index 0000000..482f283
+--- /dev/null
++++ b/cmd/api/main.go
+@@ -0,0 +1,124 @@
++// Command api is the link-shortener service entrypoint. Startup is a strict,
++// fail-fast sequence: load config, connect to Postgres and Ping, run migrations,
++// then bind and serve. The HTTP port is never bound unless every prior step
++// succeeds, so a healthy api implies a reachable database.
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"net"
++	"net/http"
++	"os"
++	"os/signal"
++	"syscall"
++	"time"
++
++	"linkshortener/internal/config"
++	"linkshortener/internal/httpapi"
++	"linkshortener/internal/migrate"
++	"linkshortener/internal/store"
++)
++
++// migrationsDir is the golang-migrate source directory, resolved relative to the
++// working directory (the image WORKDIR is /, so this is /migrations).
++const migrationsDir = "migrations"
++
++// shutdownTimeout bounds the graceful drain on SIGINT/SIGTERM.
++const shutdownTimeout = 10 * time.Second
++
++func main() {
++	os.Exit(run())
++}
++
++// run performs the startup sequence and blocks serving until a shutdown signal.
++// It returns the process exit code so deferred cleanup still runs (os.Exit in
++// main would skip defers).
++func run() int {
++	// 1. Configuration. A missing/blank DATABASE_URL is fatal before any port is
++	// bound. The error names the variable and never echoes its value.
++	cfg, err := config.Load()
++	if err != nil {
++		logFatal("config_invalid", err.Error())
++		return 1
++	}
++
++	ctx := context.Background()
++
++	// 2. Database connection + Ping. On failure the port is never bound. The
++	// reason is scrubbed of the DSN so the password cannot reach the logs.
++	pool, err := store.Open(ctx, cfg.DatabaseURL)
++	if err != nil {
++		logFatal("db_connect_failed", store.SafeReason(err, cfg.DatabaseURL))
++		return 1
++	}
++	defer pool.Close()
++
++	// 3. Migrations. ErrNoChange (E1's empty migrations dir) is success. Any
++	// other error is fatal before binding; the reason is DSN-scrubbed.
++	status, err := migrate.Run(cfg.DatabaseURL, migrationsDir)
++	if err != nil {
++		logFatal("migrate_failed", migrate.SafeReason(err, cfg.DatabaseURL))
++		return 1
++	}
++	logInfo("migrate_done", "migration runner ran: "+status)
++
++	// 4/5. Bind and serve. The listener is opened only now — after config, the
++	// DB connection, and the migration runner all succeeded — so the port is
++	// never bound in a half-up state. The "listening" line is logged strictly
++	// after the migration line above.
++	mux := httpapi.NewRouter(pool)
++	srv := &http.Server{Handler: mux}
++
++	ln, err := net.Listen("tcp", cfg.HTTPAddr)
++	if err != nil {
++		logFatal("listen_failed", "could not bind "+cfg.HTTPAddr)
++		return 1
++	}
++	logInfo("listening", "http server listening on "+cfg.HTTPAddr)
++
++	serveErr := make(chan error, 1)
++	go func() {
++		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
++			serveErr <- err
++		}
++	}()
++
++	stop := make(chan os.Signal, 1)
++	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
++
++	select {
++	case err := <-serveErr:
++		logFatal("serve_failed", "http server stopped serving: "+err.Error())
++		return 1
++	case <-stop:
++		// Graceful shutdown: stop accepting new connections and drain in-flight
++		// requests within the bounded timeout, then exit 0.
++		logInfo("shutdown", "signal received, draining connections")
++		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
++		defer cancel()
++		if err := srv.Shutdown(shutdownCtx); err != nil {
++			logInfo("shutdown_forced", "drain did not complete within timeout")
++		}
++		return 0
++	}
++}
++
++// logFatal writes a single-line JSON fatal record to stderr. reason must never
++// contain a secret; callers pass DSN-scrubbed strings.
++func logFatal(event, reason string) {
++	writeLine(os.Stderr, map[string]string{"level": "fatal", "event": event, "reason": reason})
++}
++
++// logInfo writes a single-line JSON info record to stdout.
++func logInfo(event, msg string) {
++	writeLine(os.Stdout, map[string]string{"level": "info", "event": event, "msg": msg})
++}
++
++func writeLine(w *os.File, rec map[string]string) {
++	b, err := json.Marshal(rec)
++	if err != nil {
++		return
++	}
++	_, _ = w.Write(append(b, '\n'))
++}
+diff --git a/docker-compose.yml b/docker-compose.yml
+new file mode 100644
+index 0000000..f243576
+--- /dev/null
++++ b/docker-compose.yml
+@@ -0,0 +1,33 @@
++# Two-service topology: the api and its Postgres 16 datastore, each health-checked.
++# `docker compose up -d --build` brings both to healthy well within 60 seconds.
++services:
++  db:
++    image: postgres:16
++    environment:
++      POSTGRES_USER: linkshortener
++      POSTGRES_PASSWORD: linkshortener
++      POSTGRES_DB: linkshortener
++    healthcheck:
++      test: ["CMD-SHELL", "pg_isready -U linkshortener -d linkshortener"]
++      interval: 3s
++      timeout: 3s
++      retries: 15
++      start_period: 5s
++
++  api:
++    build: .
++    environment:
++      DATABASE_URL: postgres://linkshortener:linkshortener@db:5432/linkshortener?sslmode=disable
++      HTTP_ADDR: ":8080"
++    depends_on:
++      db:
++        condition: service_healthy
++    ports:
++      - "8080:8080"
++    restart: on-failure
++    healthcheck:
++      test: ["CMD-SHELL", "wget -q -O - http://localhost:8080/healthz || exit 1"]
++      interval: 3s
++      timeout: 3s
++      retries: 15
++      start_period: 3s
+diff --git a/docs/specs/2026-09-01-gk-20260901-r99do5-packaged-service-skeleton-design.md b/docs/specs/2026-09-01-gk-20260901-r99do5-packaged-service-skeleton-design.md
+new file mode 100644
+index 0000000..85000e0
+--- /dev/null
++++ b/docs/specs/2026-09-01-gk-20260901-r99do5-packaged-service-skeleton-design.md
+@@ -0,0 +1,353 @@
++# E1 — Packaged service skeleton: docker-compose (api + Postgres), GET /healthz, env config
++
++> Spec: faffter-dark-nlspec · 2026-09-01 · autonomous · claude-code/unknown · confidence: high · spec-review: approve.
++> build-tier: complex
++> Revised 2026-09-01 (spec-review round 1 `revise`): closed infosec objections (no-secret structured fatal log; non-root runtime user) and QA objections (born-verifiable graceful-shutdown, 405, and migration-runner scenarios; defined "structured fatal log").
++> Revised 2026-09-01 (spec-review round 2, batch 1): rescoped migration verification — E1 asserts the golang-migrate runner RAN (empty `migrations/` → `ErrNoChange`), not a `schema_migrations` table (that is an E2 artifact); added a present-but-invalid-DSN no-secret-leak scenario, a non-root container-user scenario, and a connection-refused oracle for the "port never bound" claim.
++> Revised 2026-09-01 (spec-review round 2, batch 2): required ALL fatal boot logs (config/migrate/db-connect) to scrub the DSN from wrapped pgx/golang-migrate driver errors; added an unreachable-DB (`db_connect_failed`) scenario verifying the failed-Ping path + no secret leak; strengthened the migration oracle to assert the runner log precedes the port-bound log (ordering, not just presence).
++
++This is the build spec for epic E1 of the link-shortener service (gitkey `gk-20260901-r99do5`), written for the build agent and human reviewers. E1 is the first slice and the one that establishes the stack: a packaged, production-shaped service skeleton that runs under docker-compose with a real Postgres datastore, answers a `GET /healthz` liveness check, reads its configuration from the environment, wires in a schema-migration runner, and returns structured JSON errors. It deliberately stops short of the shorten, redirect, and TTL behaviour, which land in later epics (E2..E6). Everything the later epics need to exist as a runnable, health-checked surface is stood up here; nothing of the product behaviour itself is.
++
++## 1. WHY — problem and principles
++
++The load-bearing idea: this slice delivers a *runnable, health-checked container topology*, not a feature. Its whole value is that `docker compose up` brings an api container and a Postgres container to a healthy state, the api reaches the database, applies migrations, and answers `GET /healthz` with 200 within 60 seconds. Every later epic builds inside this skeleton, so the skeleton has to be real (real Postgres, real migration runner, real env config) rather than a stub.
++
++Problem statement: the repository has no service to build on. Later epics need a packaged runtime, a real datastore, a migration harness, and a health surface before any endpoint can be written. E1 stands up exactly that skeleton and proves it healthy.
++
++Design principles:
++
++- **Scope is the skeleton, not the product.** Include only what the runnable, health-checked topology needs. The `POST /shorten`, `GET /{code}` redirect, and TTL behaviour are out of scope; adding them here would pull E2..E6 forward and break the slice boundary.
++- **The definition of done is born-verifiable.** "api + db healthy and `GET /healthz` returns 200 within 60s of `docker compose up`" must be observable with `docker compose ps` and one HTTP GET, not asserted in prose.
++- **A healthy api implies a reachable database.** The api fails fast at boot if it cannot read its config, connect to Postgres, or run migrations. Because it only starts after the db is healthy and crash-loops otherwise, a running, healthy api container is itself evidence the datastore is real and reachable.
++- **Production-shaped, not a single file.** Configuration from the environment, a versioned migration, layered packages, and structured errors are in scope because the brief calls the skeleton production-shaped; a toy single-file server is explicitly rejected.
++
++Reference context: none. This is a greenfield repository (only the SUT brief, PRD, and roadmap skeleton exist); there is no prior code, architecture, or datastore to mirror or extend.
++
++Scope statement: E1 is the foundation layer of Project P1 (core shorten-to-redirect on a real datastore); it owns the packaging, config, health, and migration-runner surfaces that E2 (schema + persistence), E3 (`POST /shorten`), and E4 (`GET /{code}`) then build on.
++
++## 2. OUT OF SCOPE
++
++- **`POST /shorten` mint endpoint** — validating an absolute URL, minting a 7-char base62 code, persisting it. Why excluded: it is epic E3, and it depends on the persistence layer (E2) that is itself later. Extension point: a new handler registered on the `internal/httpapi` router, backed by `internal/store`.
++- **`GET /{code}` redirect and 404 for unknown codes** — resolving a code to a URL and issuing a 302. Why excluded: epic E4, depends on the write path (E3). Extension point: a wildcard route (`GET /{code}`) on the same router.
++- **The `links` table and its persistence layer** — the `code -> url` table with created/expiry columns and its query/insert methods. Why excluded: it is epic E2. E1 ships the migration *runner* and an empty `migrations/` directory, not the table. Extension point: the first real migration file under `migrations/`, plus a `Links` repository in `internal/store`.
++- **TTL expiry semantics** — `ttl_seconds`, expiry-on-read, expired-code 404. Why excluded: epic E5. Extension point: an `expires_at` column added by an E2/E5 migration and an expiry check in the read path.
++- **Deep readiness / dependency health in `/healthz`** — a `/healthz` that actively pings Postgres on every call. Why excluded: for this slice a shallow liveness check plus fail-fast-at-boot already makes "api + db healthy" born-verifiable (see the HOW section). A deep readiness probe is operational hardening, aligned with epic E6. Extension point: a separate `GET /readyz` handler, or a DB ping inside the existing `/healthz` handler.
++
++## 3. WHAT — vocabulary, types, and interfaces
++
++Vocabulary:
++
++| Term | Definition |
++|---|---|
++| api | The Go service container: the HTTP server that answers `/healthz` and, in later epics, the product endpoints. |
++| db | The Postgres 16 container that backs the service. |
++| liveness | A shallow check that the api process is up and serving; it does not probe dependencies. |
++| migration runner | The golang-migrate invocation the api performs at startup to bring the schema to the latest version before serving. |
++
++### Configuration (read from the environment at startup)
++
++```
++RECORD Config:
++  database_url: string      # required; Postgres DSN, e.g. postgres://user:pass@db:5432/linkshortener?sslmode=disable
++  http_addr:    string      # optional; TCP listen address, default ":8080"
++  # Validation: database_url MUST be non-empty. A missing/blank database_url is a fatal
++  # config error — the process logs a structured fatal message and exits non-zero WITHOUT
++  # binding a port. "Structured fatal message" has a concrete shape: a single-line JSON object
++  # with at least {"level":"fatal","event":"config_invalid","reason":<which variable and why>}.
++  # The log MUST NOT contain the value of DATABASE_URL (or any secret): a present-but-invalid
++  # DSN is reported by NAMING the offending variable and the validation failure, never by
++  # echoing the value — the DSN carries the database password. This rule covers ALL fatal
++  # boot logs (config, migrate, db-connect), not just config validation: raw pgx / golang-migrate
++  # driver errors frequently embed the connection string, so the fatal log records a stable
++  # failure-class event (config_invalid / migrate_failed / db_connect_failed) and MUST scrub any
++  # DSN substring (host/user/password) from a wrapped driver error — never pass driver error text
++  # through verbatim if it could contain the DSN.
++```
++
++- **Chosen:** configuration is a single `DATABASE_URL` DSN plus an optional `HTTP_ADDR` (default `:8080`), read once at startup into an immutable `Config`, with fail-fast validation — rationale: one DSN is the 12-factor-friendly shape both pgx and golang-migrate accept directly, and fail-fast on a missing DSN turns misconfiguration into an immediate, observable boot failure rather than a half-up server. Discrete `PG*` variables are rejected as an alternative in the Design Decision Rationale.
++- **Chosen:** every fatal boot log is a single-line JSON object (`level`, `event`, `reason`) and NEVER contains a secret value — an invalid `DATABASE_URL` is reported by naming the variable and the validation failure, never by echoing the DSN — rationale: echoing an "invalid" DSN into container logs (stdout/stderr) would leak the database password into log aggregation, and the structured-error envelope already forbids secrets in HTTP responses, so the boot log needs the same rule; fixing the JSON shape also turns the previously-vague "structured fatal log" into a parseable, testable line.
++
++### HTTP surface (this slice)
++
++| Method + path | Response | Notes |
++|---|---|---|
++| `GET /healthz` | `200` with JSON body `{"status":"ok"}` | Liveness. Only reachable once config loaded, DB pool established, migrations applied. |
++| any other route | `404` with a structured JSON error body | Proves the structured-error foundation; later epics register real routes. |
++| a known path with a wrong method | `405` with the same structured JSON error body | Optional-but-recommended; same envelope. |
++
++### Structured error envelope
++
++```
++RECORD ErrorResponse:
++  error: {
++    code:    string   # stable machine-readable token, e.g. "not_found", "method_not_allowed"
++    message: string   # human-readable, safe to surface; no internal detail or secrets
++  }
++```
++
++- **Chosen:** every non-2xx response the service originates uses the `{"error":{"code","message"}}` envelope with `Content-Type: application/json` — rationale: the brief requires structured errors as a production-shaping property; defining the envelope now (even though only 404/405 use it in E1) gives E3..E6 a single error shape to reuse instead of each endpoint inventing its own.
++
++### Filesystem / package layout
++
++```
++.
++├── cmd/api/main.go              # entrypoint: load config -> connect DB -> migrate -> serve
++├── internal/config/config.go    # env parsing + validation -> Config
++├── internal/httpapi/router.go   # ServeMux wiring, /healthz handler, structured 404/405 fallback
++├── internal/store/store.go      # pgxpool construction + Ping (connection foundation only)
++├── internal/migrate/migrate.go  # golang-migrate runner invoked at startup
++├── migrations/                  # golang-migrate SQL dir; EMPTY in E1 (E2 adds the first table)
++├── Dockerfile                   # multi-stage: build static Go binary -> minimal runtime image, runs as a non-root user
++├── docker-compose.yml           # services: api + db, with healthchecks
++├── go.mod / go.sum
++└── .env.example                 # documents DATABASE_URL, HTTP_ADDR (never committed real secrets)
++```
++
++- **Chosen:** the service is laid out across `cmd/` and `internal/{config,httpapi,store,migrate}` packages rather than one file — rationale: the brief explicitly rejects a toy single-file service; separate packages give E2..E6 clear seams (a store package to add repositories to, a router to register handlers on).
++- **Chosen:** the runtime image runs the api as a dedicated non-root user (a uid created in the final stage, `USER` set to it) rather than the default root — rationale: a Go static binary in a minimal image runs as root unless a user is explicitly set, so a container escape or RCE in a later epic would hold root inside the container; dropping to a non-root uid now is a one-line hardening that shrinks blast radius and costs nothing here (the static binary needs no privileged port — `HTTP_ADDR` defaults to `:8080`).
++
++## 4. HOW — behaviour
++
++Architecture and approach: the api is a Go 1.22 program using the standard library `net/http` with `ServeMux` method-and-path routing (no third-party web framework). Startup is a strict, fail-fast sequence; only after it completes does the server bind and accept traffic. Postgres access is via `pgxpool`. Schema is owned by golang-migrate and applied at startup. The whole thing is packaged as two docker-compose services with healthchecks.
++
++Startup sequence (the api entrypoint):
++
++```
++PROCEDURE main():
++  1. cfg := config.Load(environment)
++     - IF cfg invalid (e.g. DATABASE_URL empty):
++         log a structured fatal message (single-line JSON, naming the offending variable, NEVER its value);
++         EXIT non-zero. Do NOT bind a port.
++  2. runner := migrate.New(cfg.database_url, "migrations/")
++     - Apply all pending migrations (golang-migrate `up`).
++     - Treat "no change" (no pending migrations) as SUCCESS — E1's migrations dir is empty.
++     - IF the runner errors for any other reason: log structured fatal (event "migrate_failed",
++       DSN scrubbed — do NOT wrap the raw golang-migrate error if it embeds the connection string);
++       EXIT non-zero.
++  3. pool := store.Open(cfg.database_url)
++     - Establish a pgxpool; Ping once to confirm connectivity.
++     - IF Ping fails: log structured fatal (event "db_connect_failed", DSN scrubbed — do NOT wrap
++       the raw pgx error verbatim if it embeds the connection string); EXIT non-zero. Do NOT bind a port.
++  4. mux := httpapi.NewRouter(pool)   # /healthz + structured 404/405 fallback
++  5. Start the HTTP server on cfg.http_addr.
++     - Install a signal handler (SIGINT/SIGTERM) for graceful shutdown.
++     - On SIGINT/SIGTERM: stop accepting new connections, call http.Server.Shutdown with a bounded
++       timeout (<= 10s) to drain in-flight requests, then EXIT 0. A shutdown that completes draining
++       within the timeout is "graceful"; the observable is exit code 0 within the timeout window.
++```
++
++Behaviour summary: the process either reaches step 5 with a validated config, a migrated schema, and a live database connection, or it exits non-zero before binding a port. There is no partially-up state in which `/healthz` answers while the datastore is unreachable.
++
++`GET /healthz` behaviour:
++
++```
++PROCEDURE healthz(request):
++  1. Return 200 with Content-Type application/json and body {"status":"ok"}.
++  # Shallow by design: reaching this handler already implies config + DB + migrations succeeded at boot.
++```
++
++Structured not-found / method-not-allowed:
++
++```
++PROCEDURE fallback(request):
++  1. IF no route matches the path:
++     Return 404, Content-Type application/json,
++       body {"error":{"code":"not_found","message":"resource not found"}}.
++  2. IF a path matches but the method does not:
++     Return 405 with {"error":{"code":"method_not_allowed","message":"method not allowed"}}.
++```
++
++Edge cases and error handling:
++
++- **Missing/blank `DATABASE_URL`** — terminal at boot; structured fatal log, non-zero exit, no port bound. Not retryable.
++- **Postgres not yet accepting connections when the api starts** — mitigated by compose ordering (`api depends_on db: condition: service_healthy`). If a connection still fails, the api exits non-zero and compose restarts it (`restart: on-failure`), so a slow db start self-heals within the 60s window rather than leaving the api half-up.
++- **golang-migrate returns `ErrNoChange`** — not an error; treated as success (E1 has no pending migrations).
++- **Any other migration error** — terminal at boot; non-zero exit. Not retryable without a fix.
++
++Failure modes:
++
++- **The failure:** `/healthz` returns 200 while the database is not actually reachable, making "api + db healthy" a false positive. **How you'd know:** the api container would be `healthy` in `docker compose ps` while the db container is not, or while a `psql` into the db fails. **What it means:** proceed — the fail-fast boot sequence (connect + Ping + migrate before bind) plus `api depends_on db: service_healthy` makes this state unreachable; a healthy api is contingent on a successful DB connection at boot, so the shallow `/healthz` is sound for this slice.
++- **The failure:** the migration runner is wired but never actually executes, so E2's migrations would silently not run. **How you'd know:** the api startup logs would not show the golang-migrate step running (no "applying migrations" / "no change" line) before the server binds. **What it means:** proceed — E1 asserts the runner *executes* at boot (fail-fast: any migration error is a non-zero exit before bind, so a healthy api is contingent on the runner completing), which is the observable the harness E2 depends on is live. E1 does NOT assert the `schema_migrations` table, because golang-migrate creates no version table for an empty `migrations/` dir (`ErrNoChange`); the table first appears with E2's initial migration.
++
++Anti-patterns:
++
++- **Anti-pattern:** making `/healthz` ping Postgres on every request. Why: it turns a liveness probe into a readiness probe, couples container health to transient DB blips, and is out of scope for this slice (see OUT OF SCOPE).
++- **Anti-pattern:** adding a `links` table (or any product table) migration in E1. Why: that is epic E2; E1 ships only the runner and an empty `migrations/` dir.
++- **Anti-pattern:** binding the HTTP port before config/DB/migrations succeed. Why: it creates a half-up server that answers `/healthz` 200 while the datastore is unreachable, breaking the "healthy api implies reachable db" invariant.
++
++### docker-compose topology
++
++```
++services:
++  db:
++    image: postgres:16
++    environment: POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB
++    healthcheck: pg_isready -U <user> -d <db>   # interval/timeout/retries tuned to be healthy well within 60s
++  api:
++    build: .                                    # the multi-stage Dockerfile
++    environment: DATABASE_URL (points at db:5432), HTTP_ADDR
++    depends_on: db: { condition: service_healthy }
++    ports: "8080:8080"
++    restart: on-failure
++    healthcheck: GET /healthz returns 200        # e.g. wget/curl -f http://localhost:8080/healthz
++```
++
++- **Chosen:** the api's compose healthcheck is `GET /healthz` and the db's is `pg_isready`, with `api depends_on db: service_healthy` — rationale: this makes the DoD's "api + db healthy" a first-class, observable compose state (`docker compose ps` shows both `healthy`), and hands the downstream env-compose provisioner a health-checked surface to point at.
++
++## Scenarios
++
++> 2 holdout scenario(s) withheld from this view — evaluated code-blind against the running feature; full spec on the tracker.
++
++Given the repository at E1, When `docker compose up -d --build` is run, Then within 60 seconds both the `db` and `api` containers report `healthy` (observable via `docker compose ps`) and `GET http://localhost:8080/healthz` returns HTTP 200 with body `{"status":"ok"}`.
++
++Given the running api, When a client sends `GET /healthz`, Then the status is 200, the `Content-Type` is `application/json`, and the body is `{"status":"ok"}`.
++
++Given the running api, When a client sends `POST /healthz` (a defined path with an unsupported method), Then the status is 405, the `Content-Type` is `application/json`, and the body is a structured error of the form `{"error":{"code":"method_not_allowed","message":"..."}}`.
++
++Given the running stack, When the api has reached `healthy` after `docker compose up`, Then the api's startup logs show the golang-migrate runner ran to completion at boot (applying all pending migrations, or logging `no change` for E1's empty `migrations/` dir) AND that runner log line appears strictly BEFORE the "listening"/port-bound log line — the observable that the runner is wired, executes, and runs before the server binds (fail-fast ordering, not an async side-task). (E1 does NOT assert the `schema_migrations` bookkeeping table: golang-migrate returns `ErrNoChange` and creates no version table when `migrations/` is empty; that table first appears with E2's initial migration.)
++
++Given the running api, When it is sent SIGTERM (e.g. `docker compose stop api`), Then it stops accepting new connections, drains in-flight requests, and exits with code 0 within the 10-second shutdown timeout (observable as a clean, non-timeout container stop / exit status 0), rather than being force-killed on timeout.
++
++Given the api started with a present-but-invalid `DATABASE_URL` (a syntactically malformed DSN carrying a recognisable password token, e.g. `DATABASE_URL="not://a valid dsn:sup3rSecret@"`), When the process starts, Then it logs a structured fatal message and exits non-zero without binding the HTTP port, AND the entire captured log output does NOT contain the secret token (`sup3rSecret`) or the raw DSN value — the offending variable is named, its value is never echoed.
++
++Given the built api image, When the running container's effective user is inspected (e.g. `docker compose exec api id -u`, or reading the image config `User`), Then it is a non-root uid (not `0`) — the `Dockerfile` sets `USER` to a dedicated non-root account.
++
++Given the api started with a well-formed `DATABASE_URL` that points at an UNREACHABLE database (e.g. a dead host/port, or the `db` service stopped, with a recognisable password token in the DSN), When the process starts, Then the Ping fails, the api logs a structured fatal message (event `db_connect_failed`) and exits non-zero WITHOUT binding the HTTP port (verified by the connection-refused oracle on `HTTP_ADDR`), AND the captured log output does NOT contain the password token or the raw DSN — the wrapped pgx driver error is scrubbed of the connection string. This exercises the failed-Ping path and the "healthy api implies a reachable db" invariant.
++
++- The api process MUST NOT bind its HTTP port unless config loaded, the migration runner ran, and the Postgres connection succeeded at boot (a healthy api implies a reachable db).
++
++## 6. Design decision rationale
++
++**Which language/runtime for the service?**
++- TypeScript on Node 20 — pros: brief's first-listed option, huge ecosystem, familiar REST+Postgres path. Cons: larger runtime image, slower cold start, more moving parts to reach a minimal healthy container.
++- Go 1.22 — pros: single static binary → smallest api image and fastest cold start (the direct lever on the 60s `/healthz` DoD); Go 1.22's `net/http.ServeMux` gives method+path routing with no framework dependency; mature Postgres driver (pgx) and migration tool (golang-migrate). Cons: slightly more boilerplate for JSON handling than a TS framework.
++- **Chosen:** Go 1.22 on stdlib `net/http` — the build-biased best fit: minimal dependencies, fastest path to a healthy container, and everything built and run locally under docker-compose with no managed service. (See the architecture-proposal block in section 9.)
++
++**How is the schema owned?**
++- Ad-hoc DDL at startup — pros: no tool. Cons: not versioned, not reviewable, no bookkeeping.
++- golang-migrate SQL migrations applied on start — pros: deterministic, versioned, reviewable; gives E2 a first-class place to add the `links` table and the `schema_migrations` bookkeeping table it will create on first real migration. Cons: one dependency. (In E1 the `migrations/` dir is empty, so the runner returns `ErrNoChange` and creates no version table yet — E1 verifies the runner *ran*, not that a table exists.)
++- **Chosen:** golang-migrate, run to latest at startup, `ErrNoChange` treated as success — rationale: the migration is a first-class artifact per the brief, and E1 needs the *runner* live even though the first real migration is E2's.
++
++**Configuration shape?**
++- Discrete `PGHOST/PGUSER/...` variables — pros: granular. Cons: more surface, more validation, diverges from what pgx/migrate accept directly.
++- Single `DATABASE_URL` DSN (+ `HTTP_ADDR`) — pros: one value both pgx and golang-migrate consume directly; 12-factor-friendly; trivial fail-fast check. Cons: less granular.
++- **Chosen:** `DATABASE_URL` + optional `HTTP_ADDR`, validated fail-fast at boot.
++
++**Is `/healthz` shallow liveness or deep readiness?**
++- Deep (ping DB each call) — pros: reflects live DB state. Cons: readiness, not liveness; couples health to transient blips; out of scope for the skeleton.
++- Shallow (200 once serving) + fail-fast boot — pros: simple, and the boot sequence + `depends_on: service_healthy` already make "api + db healthy" born-verifiable. Cons: does not catch a DB that drops after boot (acceptable for this slice; a `/readyz` is the named extension point).
++- **Chosen:** shallow liveness plus fail-fast boot; deep readiness is an extension point for later operational hardening (E6).
++
++## 7. Open questions and assumptions
++
++Open questions: none. Every decision in this slice is closed above; the slice is deliberately small and its choices follow directly from the brief and the architecture proposal.
++
++Assumptions:
++
++- **Assumes:** a Docker engine with the Compose v2 plugin is available in the environment that runs the DoD check (`docker compose up`, `docker compose ps`). Validation: `docker compose version` succeeds before the DoD is exercised.
++- **Assumes:** `postgres:16` is pullable (or already cached) in that environment. Validation: `docker compose pull db` (or the first `up`) succeeds.
++- **Assumes:** outbound module fetching (Go module proxy) is available at image build time, or modules are vendored. Validation: `docker compose build api` succeeds.
++
++## 8. DONE — definition of done
++
++### From WHY
++- [ ] `docker compose up -d --build` brings both `api` and `db` containers to `healthy` within 60 seconds, observable via `docker compose ps`.
++- [ ] `GET /healthz` returns 200 within 60 seconds of `docker compose up`.
++
++### From WHAT (config)
++- [ ] Config is read from the environment at startup: `DATABASE_URL` (required) and `HTTP_ADDR` (default `:8080`).
++- [ ] A missing/blank `DATABASE_URL` causes a structured fatal log (single-line JSON with `level`/`event`/`reason`) and a non-zero exit with no port bound.
++- [ ] No fatal (or any) boot log contains the value of `DATABASE_URL` or any secret; an invalid DSN is reported by naming the variable, not by echoing its value — verified for an unset DSN, a present-but-invalid (malformed) DSN, AND an unreachable-DB (`db_connect_failed`) case, asserting the captured logs contain no secret token from the DSN. Wrapped pgx / golang-migrate driver errors are scrubbed of the connection string (never passed through verbatim).
++
++### From WHAT (HTTP surface + errors)
++- [ ] `GET /healthz` returns 200, `Content-Type: application/json`, body `{"status":"ok"}`.
++- [ ] An undefined route returns 404 with a structured JSON body `{"error":{"code":"not_found","message":...}}`.
++- [ ] A defined path with an unsupported method returns 405 with a structured JSON body `{"error":{"code":"method_not_allowed","message":...}}`.
++- [ ] A structured error envelope `{"error":{"code","message"}}` exists and is used by the 404 (and 405) fallback.
++
++### From WHAT (layout)
++- [ ] The service is organised across `cmd/api` and `internal/{config,httpapi,store,migrate}` packages (not a single file).
++- [ ] A `migrations/` directory exists and is wired into the startup runner (empty in E1).
++
++### From HOW (behaviour)
++- [ ] The api runs the golang-migrate runner at startup (before binding the HTTP port), treating `ErrNoChange` for E1's empty `migrations/` dir as success; the runner's execution is observable in the startup logs, and its log line appears strictly BEFORE the port-bound log line (fail-fast ordering); any migration error is a non-zero exit before bind. (E1 does NOT assert a `schema_migrations` table — golang-migrate creates none for an empty migrations dir; that is an E2 observable.)
++- [ ] The api establishes a pgxpool and Pings Postgres successfully at boot; a failed Ping is a non-zero exit — verified by a scenario that points `DATABASE_URL` at an unreachable DB and asserts a `db_connect_failed` fatal exit with no port bound.
++- [ ] The api does not bind its HTTP port unless config, the migration runner, and the DB connection all succeed — verified by its oracle: during any boot-failure window a TCP connect to `HTTP_ADDR` is refused (connection refused), so the port is never bound.
++- [ ] SIGINT/SIGTERM triggers a graceful HTTP shutdown: new connections stop, in-flight requests drain, and the process exits 0 within a bounded (<= 10s) timeout — verified by a clean stop / exit status 0 rather than a force-kill on timeout.
++
++### From HOW (compose topology)
++- [ ] `docker-compose.yml` defines `api` and `db` services; `db` has a `pg_isready` healthcheck; `api` has a `GET /healthz` healthcheck and `depends_on db: condition: service_healthy`.
++- [ ] A multi-stage `Dockerfile` builds a static Go binary into a minimal runtime image, and the final image runs the api as a dedicated non-root user (`USER` is set, not root) — verified by inspecting the running container's effective uid (`id -u` != 0).
++- [ ] `.env.example` documents `DATABASE_URL` and `HTTP_ADDR`; no real secrets are committed.
++
++Integration smoke test:
++
++```
++1. docker compose up -d --build
++2. Poll GET http://localhost:8080/healthz until 200 or 60s elapse.
++3. Assert docker compose ps shows api healthy AND db healthy.
++4. Assert GET /does-not-exist returns 404 with {"error":{"code":"not_found",...}}.
++5. Assert POST /healthz returns 405 with {"error":{"code":"method_not_allowed",...}}.
++6. Assert the api startup logs show the golang-migrate runner ran at boot AND before the port-bound line (e.g. docker compose logs api shows a "migrat"/"no change" line ordered before the "listening" line) — NOT that a schema_migrations table exists (E1's migrations dir is empty; that table is an E2 artifact).
++7. docker compose stop api; assert the api container exited 0 (graceful drain, not a force-kill on timeout).
++8. docker compose down -v
++```
++
++## 9. Architecture proposal (carried verbatim — downstream consumers read it from here)
++
++The following validated `faff-contract:architecture-proposal` block is the architecture decided for this stack-establishing epic. Downstream epics (E2..E6) and the holdout env step read it from this spec; do not re-decide the stack.
++
++```faff-contract:architecture-proposal
++{
++  "chosen_architecture": "Modular Go 1.22 service on the standard-library net/http router, backed by Postgres 16, packaged as a two-service docker-compose (api + db). Schema is owned by golang-migrate SQL migrations applied on api start; all config is read from the environment at startup; all error responses are structured JSON. Layered into cmd/ (entrypoint), internal/config, internal/httpapi (handlers incl. /healthz), internal/store (pgxpool), and migrations/ — not a single-file toy.",
++  "rationale": "The brief fixes the stack envelope (Postgres datastore, docker-compose api+db, GET /healthz, env-config, a migration, structured errors, not a toy single-file) and offers TypeScript on Node 20 or Go 1.22 as the build-biased best fit. No infra profile is minable on this fresh repo (faff profile show reports no profile), so the choice is made from the brief alone. Go 1.22 is chosen: a single static binary yields the smallest api image and the fastest cold start, the direct lever on the born-verifiable DoD (api+db healthy and GET /healthz returns 200 within 60s of docker compose up). Go 1.22's enhanced net/http.ServeMux gives method-and-path routing from the standard library, so the HTTP surface needs no third-party web framework; pgx/pgxpool is the mature Postgres driver with pooling; golang-migrate applies the schema deterministically on start and gives later epics (the links table) a first-class place to land. Everything is built and run locally under docker-compose with no managed service, so the recommendation is build.",
++  "adr_candidates": [
++    { "title": "Go 1.22 on the standard-library net/http for the service runtime", "decision": "Build the api in Go 1.22 using net/http.ServeMux method-and-path routing; no third-party web framework", "rationale": "single static binary means the smallest image and fastest healthy startup, the 60s /healthz DoD lever; Go 1.22 routing patterns remove the need for a router dependency" },
++    { "title": "Postgres 16 as the persistence datastore, accessed via pgx", "decision": "Use Postgres 16 as the only datastore, connection-pooled through pgxpool", "rationale": "the brief fixes a real persistent store; pgx is the mature, well-supported driver and provides the pooling a long-running service needs" },
++    { "title": "Schema owned by golang-migrate, applied on api start", "decision": "Version the schema as golang-migrate SQL migrations and run them to latest at api startup before the server accepts traffic", "rationale": "deterministic, reviewable schema evolution; keeps the migration a first-class artifact rather than ad-hoc DDL and gives later epics a place to add the links table" },
++    { "title": "Two-service docker-compose topology with healthchecks", "decision": "Package as docker-compose services api and db; db carries a pg_isready healthcheck, api depends_on db being healthy, api exposes GET /healthz as its own healthcheck", "rationale": "makes 'api+db healthy' born-verifiable and gives the env-compose provisioner a health-checked surface to point at" },
++    { "title": "12-factor environment configuration with fail-fast validation", "decision": "Read all configuration (Postgres DSN or parts, HTTP listen port) from the environment at startup and fail fast on missing/invalid values; emit structured JSON errors", "rationale": "production-shaped per the brief; env-config is exactly what the env-compose step seeds and the holdout evaluator exercises" }
++  ],
++  "assumptions": [
++    "No infra profile is minable on this fresh repo (faff profile show reports no profile); the architecture is fitted from the brief's stated stack preference alone.",
++    "Postgres 16 is an acceptable concrete pin for the brief's generic 'Postgres' datastore; no acceptance criterion constrains the exact minor version.",
++    "Traffic is single-instance and single-region for this slice; no clustering, read-replica, or horizontal-scale topology is implied."
++  ],
++  "recommendation": "build"
++}
++```
++
++## ADR promotion intent
++
++- **Go 1.22 on the standard-library net/http for the service runtime** (from section 6 / section 9) — decision: build the api in Go 1.22 with `net/http.ServeMux` routing, no web framework.
++- **Postgres 16 as the persistence datastore via pgx** (section 9) — decision: Postgres 16 as the only datastore, pooled through pgxpool.
++- **Schema owned by golang-migrate, applied on start** (section 6 / section 9) — decision: versioned SQL migrations run to latest at startup, `ErrNoChange` treated as success.
++- **Two-service docker-compose topology with healthchecks** (section 4 / section 9) — decision: `api` + `db` services, `pg_isready` and `GET /healthz` healthchecks, `depends_on: service_healthy`.
++- **12-factor env configuration with fail-fast validation and structured JSON errors** (section 3 / section 9) — decision: `DATABASE_URL` + `HTTP_ADDR` from the environment, validated at boot; `{"error":{"code","message"}}` envelope.
++
++## Methodology critique
++
++Methodology: faffter-dark-methodology-agile-delivery
++
++- **Right-sized (principle 4):** No issues. E1 is a single, cohesive 1-3 day unit. Config, compose topology, and the migration runner are not independent concerns that could ship separately: the container topology is not healthy unless all three are present, so they form one deliverable, not a split candidate. It is not oversized (no product endpoints), and not a micro-fragment.
++- **Workstream fit (principles 1 + 5):** No issues. E1 sits in Project P1 "Core shorten to redirect on a real datastore", an outcome-named container, as its foundation slice. The slice encodes one outcome (a runnable, health-checked stack), so it is cohesive.
++- **Surfaced dependencies (principle 6):** No issues. E1 is blocked-by nothing (it is the first slice), and the downstream chain E2 blocked-by E1 is already explicit in the roadmap skeleton. No implicit dependency is hidden in the spec.
++- **Risk profile (principle 7):** Positive. E1 front-loads the main integration risk of the whole service, the docker-compose api+db topology and migrate-on-start, into the first slice. That is exactly the early de-risking principle 7 calls for; no separate de-risking spike is warranted because E1 is itself the de-risking slice.
++
++confidence: high
++
++```faff-contract:spec-readiness
++{ "confidence": "high",
++  "decisions": [
++    { "marker": "chosen" },
++    { "marker": "chosen" },
++    { "marker": "chosen" },
++    { "marker": "chosen" },
++    { "marker": "chosen" },
++    { "marker": "chosen" },
++    { "marker": "chosen" },
++    { "marker": "chosen" },
++    { "marker": "chosen" },
++    { "marker": "assumes" }
++  ] }
++```
+\ No newline at end of file
+diff --git a/go.mod b/go.mod
+new file mode 100644
+index 0000000..34e2cb3
+--- /dev/null
++++ b/go.mod
+@@ -0,0 +1,23 @@
++module linkshortener
++
++go 1.22.0
++
++toolchain go1.22.12
++
++require (
++	github.com/golang-migrate/migrate/v4 v4.18.1
++	github.com/jackc/pgx/v5 v5.5.4
++)
++
++require (
++	github.com/hashicorp/errwrap v1.1.0 // indirect
++	github.com/hashicorp/go-multierror v1.1.1 // indirect
++	github.com/jackc/pgpassfile v1.0.0 // indirect
++	github.com/jackc/pgservicefile v0.0.0-20221227161230-091c0ba34f0a // indirect
++	github.com/jackc/puddle/v2 v2.2.1 // indirect
++	github.com/lib/pq v1.10.9 // indirect
++	go.uber.org/atomic v1.7.0 // indirect
++	golang.org/x/crypto v0.27.0 // indirect
++	golang.org/x/sync v0.8.0 // indirect
++	golang.org/x/text v0.18.0 // indirect
++)
+diff --git a/go.sum b/go.sum
+new file mode 100644
+index 0000000..bb45c54
+--- /dev/null
++++ b/go.sum
+@@ -0,0 +1,83 @@
++github.com/Azure/go-ansiterm v0.0.0-20230124172434-306776ec8161 h1:L/gRVlceqvL25UVaW/CKtUDjefjrs0SPonmDGUVOYP0=
++github.com/Azure/go-ansiterm v0.0.0-20230124172434-306776ec8161/go.mod h1:xomTg63KZ2rFqZQzSB4Vz2SUXa1BpHTVz9L5PTmPC4E=
++github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERoyfY=
++github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
++github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
++github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
++github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
++github.com/dhui/dktest v0.4.3 h1:wquqUxAFdcUgabAVLvSCOKOlag5cIZuaOjYIBOWdsR0=
++github.com/dhui/dktest v0.4.3/go.mod h1:zNK8IwktWzQRm6I/l2Wjp7MakiyaFWv4G1hjmodmMTs=
++github.com/distribution/reference v0.6.0 h1:0IXCQ5g4/QMHHkarYzh5l+u8T3t73zM5QvfrDyIgxBk=
++github.com/distribution/reference v0.6.0/go.mod h1:BbU0aIcezP1/5jX/8MP0YiH4SdvB5Y4f/wlDRiLyi3E=
++github.com/docker/docker v27.2.0+incompatible h1:Rk9nIVdfH3+Vz4cyI/uhbINhEZ/oLmc+CBXmH6fbNk4=
++github.com/docker/docker v27.2.0+incompatible/go.mod h1:eEKB0N0r5NX/I1kEveEz05bcu8tLC/8azJZsviup8Sk=
++github.com/docker/go-connections v0.5.0 h1:USnMq7hx7gwdVZq1L49hLXaFtUdTADjXGp+uj1Br63c=
++github.com/docker/go-connections v0.5.0/go.mod h1:ov60Kzw0kKElRwhNs9UlUHAE/F9Fe6GLaXnqyDdmEXc=
++github.com/docker/go-units v0.5.0 h1:69rxXcBk27SvSaaxTtLh/8llcHD8vYHT7WSdRZ/jvr4=
++github.com/docker/go-units v0.5.0/go.mod h1:fgPhTUdO+D/Jk86RDLlptpiXQzgHJF7gydDDbaIK4Dk=
++github.com/felixge/httpsnoop v1.0.4 h1:NFTV2Zj1bL4mc9sqWACXbQFVBBg2W3GPvqp8/ESS2Wg=
++github.com/felixge/httpsnoop v1.0.4/go.mod h1:m8KPJKqk1gH5J9DgRY2ASl2lWCfGKXixSwevea8zH2U=
++github.com/go-logr/logr v1.4.2 h1:6pFjapn8bFcIbiKo3XT4j/BhANplGihG6tvd+8rYgrY=
++github.com/go-logr/logr v1.4.2/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
++github.com/go-logr/stdr v1.2.2 h1:hSWxHoqTgW2S2qGc0LTAI563KZ5YKYRhT3MFKZMbjag=
++github.com/go-logr/stdr v1.2.2/go.mod h1:mMo/vtBO5dYbehREoey6XUKy/eSumjCCveDpRre4VKE=
++github.com/gogo/protobuf v1.3.2 h1:Ov1cvc58UF3b5XjBnZv7+opcTcQFZebYjWzi34vdm4Q=
++github.com/gogo/protobuf v1.3.2/go.mod h1:P1XiOD3dCwIKUDQYPy72D8LYyHL2YPYrpS2s69NZV8Q=
++github.com/golang-migrate/migrate/v4 v4.18.1 h1:JML/k+t4tpHCpQTCAD62Nu43NUFzHY4CV3uAuvHGC+Y=
++github.com/golang-migrate/migrate/v4 v4.18.1/go.mod h1:HAX6m3sQgcdO81tdjn5exv20+3Kb13cmGli1hrD6hks=
++github.com/hashicorp/errwrap v1.0.0/go.mod h1:YH+1FKiLXxHSkmPseP+kNlulaMuP3n2brvKWEqk/Jc4=
++github.com/hashicorp/errwrap v1.1.0 h1:OxrOeh75EUXMY8TBjag2fzXGZ40LB6IKw45YeGUDY2I=
++github.com/hashicorp/errwrap v1.1.0/go.mod h1:YH+1FKiLXxHSkmPseP+kNlulaMuP3n2brvKWEqk/Jc4=
++github.com/hashicorp/go-multierror v1.1.1 h1:H5DkEtf6CXdFp0N0Em5UCwQpXMWke8IA0+lD48awMYo=
++github.com/hashicorp/go-multierror v1.1.1/go.mod h1:iw975J/qwKPdAO1clOe2L8331t/9/fmwbPZ6JB6eMoM=
++github.com/jackc/pgpassfile v1.0.0 h1:/6Hmqy13Ss2zCq62VdNG8tM1wchn8zjSGOBJ6icpsIM=
++github.com/jackc/pgpassfile v1.0.0/go.mod h1:CEx0iS5ambNFdcRtxPj5JhEz+xB6uRky5eyVu/W2HEg=
++github.com/jackc/pgservicefile v0.0.0-20221227161230-091c0ba34f0a h1:bbPeKD0xmW/Y25WS6cokEszi5g+S0QxI/d45PkRi7Nk=
++github.com/jackc/pgservicefile v0.0.0-20221227161230-091c0ba34f0a/go.mod h1:5TJZWKEWniPve33vlWYSoGYefn3gLQRzjfDlhSJ9ZKM=
++github.com/jackc/pgx/v5 v5.5.4 h1:Xp2aQS8uXButQdnCMWNmvx6UysWQQC+u1EoizjguY+8=
++github.com/jackc/pgx/v5 v5.5.4/go.mod h1:ez9gk+OAat140fv9ErkZDYFWmXLfV+++K0uAOiwgm1A=
++github.com/jackc/puddle/v2 v2.2.1 h1:RhxXJtFG022u4ibrCSMSiu5aOq1i77R3OHKNJj77OAk=
++github.com/jackc/puddle/v2 v2.2.1/go.mod h1:vriiEXHvEE654aYKXXjOvZM39qJ0q+azkZFrfEOc3H4=
++github.com/lib/pq v1.10.9 h1:YXG7RB+JIjhP29X+OtkiDnYaXQwpS4JEWq7dtCCRUEw=
++github.com/lib/pq v1.10.9/go.mod h1:AlVN5x4E4T544tWzH6hKfbfQvm3HdbOxrmggDNAPY9o=
++github.com/moby/docker-image-spec v1.3.1 h1:jMKff3w6PgbfSa69GfNg+zN/XLhfXJGnEx3Nl2EsFP0=
++github.com/moby/docker-image-spec v1.3.1/go.mod h1:eKmb5VW8vQEh/BAr2yvVNvuiJuY6UIocYsFu/DxxRpo=
++github.com/moby/term v0.5.0 h1:xt8Q1nalod/v7BqbG21f8mQPqH+xAaC9C3N3wfWbVP0=
++github.com/moby/term v0.5.0/go.mod h1:8FzsFHVUBGZdbDsJw/ot+X+d5HLUbvklYLJ9uGfcI3Y=
++github.com/morikuni/aec v1.0.0 h1:nP9CBfwrvYnBRgY6qfDQkygYDmYwOilePFkwzv4dU8A=
++github.com/morikuni/aec v1.0.0/go.mod h1:BbKIizmSmc5MMPqRYbxO4ZU0S0+P200+tUnFx7PXmsc=
++github.com/opencontainers/go-digest v1.0.0 h1:apOUWs51W5PlhuyGyz9FCeeBIOUDA/6nW8Oi/yOhh5U=
++github.com/opencontainers/go-digest v1.0.0/go.mod h1:0JzlMkj0TRzQZfJkVvzbP0HBR3IKzErnv2BNG4W4MAM=
++github.com/opencontainers/image-spec v1.1.0 h1:8SG7/vwALn54lVB/0yZ/MMwhFrPYtpEHQb2IpWsCzug=
++github.com/opencontainers/image-spec v1.1.0/go.mod h1:W4s4sFTMaBeK1BQLXbG4AdM2szdn85PY75RI83NrTrM=
++github.com/pkg/errors v0.9.1 h1:FEBLx1zS214owpjy7qsBeixbURkuhQAwrK5UwLGTwt4=
++github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
++github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
++github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
++github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
++github.com/stretchr/testify v1.3.0/go.mod h1:M5WIy9Dh21IEIfnGCwXGc5bZfKNJtfHm1UVUgZn+9EI=
++github.com/stretchr/testify v1.7.0/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
++github.com/stretchr/testify v1.9.0 h1:HtqpIVDClZ4nwg75+f6Lvsy/wHu+3BoSGCbBAcpTsTg=
++github.com/stretchr/testify v1.9.0/go.mod h1:r2ic/lqez/lEtzL7wO/rwa5dbSLXVDPFyf8C91i36aY=
++go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.54.0 h1:TT4fX+nBOA/+LUkobKGW1ydGcn+G3vRw9+g5HwCphpk=
++go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.54.0/go.mod h1:L7UH0GbB0p47T4Rri3uHjbpCFYrVrwc1I25QhNPiGK8=
++go.opentelemetry.io/otel v1.29.0 h1:PdomN/Al4q/lN6iBJEN3AwPvUiHPMlt93c8bqTG5Llw=
++go.opentelemetry.io/otel v1.29.0/go.mod h1:N/WtXPs1CNCUEx+Agz5uouwCba+i+bJGFicT8SR4NP8=
++go.opentelemetry.io/otel/metric v1.29.0 h1:vPf/HFWTNkPu1aYeIsc98l4ktOQaL6LeSoeV2g+8YLc=
++go.opentelemetry.io/otel/metric v1.29.0/go.mod h1:auu/QWieFVWx+DmQOUMgj0F8LHWdgalxXqvp7BII/W8=
++go.opentelemetry.io/otel/trace v1.29.0 h1:J/8ZNK4XgR7a21DZUAsbF8pZ5Jcw1VhACmnYt39JTi4=
++go.opentelemetry.io/otel/trace v1.29.0/go.mod h1:eHl3w0sp3paPkYstJOmAimxhiFXPg+MMTlEh3nsQgWQ=
++go.uber.org/atomic v1.7.0 h1:ADUqmZGgLDDfbSL9ZmPxKTybcoEYHgpYfELNoN+7hsw=
++go.uber.org/atomic v1.7.0/go.mod h1:fEN4uk6kAWBTFdckzkM89CLk9XfWZrxpCo0nPH17wJc=
++golang.org/x/crypto v0.27.0 h1:GXm2NjJrPaiv/h1tb2UH8QfgC/hOf/+z0p6PT8o1w7A=
++golang.org/x/crypto v0.27.0/go.mod h1:1Xngt8kV6Dvbssa53Ziq6Eqn0HqbZi5Z6R0ZpwQzt70=
++golang.org/x/sync v0.8.0 h1:3NFvSEYkUoMifnESzZl15y791HH1qU2xm6eCJU5ZPXQ=
++golang.org/x/sync v0.8.0/go.mod h1:Czt+wKu1gCyEFDUtn0jG5QVvpJ6rzVqr5aXyt9drQfk=
++golang.org/x/sys v0.25.0 h1:r+8e+loiHxRqhXVl6ML1nO3l1+oFoWbnlu2Ehimmi34=
++golang.org/x/sys v0.25.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=
++golang.org/x/text v0.18.0 h1:XvMDiNzPAl0jr17s6W9lcaIhGUfUORdGCNsuLmPG224=
++golang.org/x/text v0.18.0/go.mod h1:BuEKDfySbSR4drPmRPG/7iBdf8hvFMuRexcpahXilzY=
++gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
++gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
++gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
++gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
+diff --git a/internal/config/config.go b/internal/config/config.go
+new file mode 100644
+index 0000000..4ec1f62
+--- /dev/null
++++ b/internal/config/config.go
+@@ -0,0 +1,42 @@
++// Package config reads and validates the service configuration from the
++// environment at startup. It never returns the value of a secret (such as the
++// database password embedded in DATABASE_URL) in an error: a validation failure
++// names the offending variable, it does not echo its value.
++package config
++
++import (
++	"errors"
++	"os"
++)
++
++// DefaultHTTPAddr is the listen address used when HTTP_ADDR is unset.
++const DefaultHTTPAddr = ":8080"
++
++// Config is the immutable, validated configuration read once at startup.
++type Config struct {
++	// DatabaseURL is the Postgres DSN. Required.
++	DatabaseURL string
++	// HTTPAddr is the TCP listen address. Defaults to DefaultHTTPAddr.
++	HTTPAddr string
++}
++
++// ErrMissingDatabaseURL is returned when DATABASE_URL is absent or blank. Its
++// text names the variable only and never contains a value.
++var ErrMissingDatabaseURL = errors.New("DATABASE_URL is required but was empty or unset")
++
++// Load reads the configuration from the process environment and validates it.
++// A missing or blank DATABASE_URL is a fatal configuration error. The returned
++// error is safe to log: it never contains the value of any environment variable.
++func Load() (Config, error) {
++	cfg := Config{
++		DatabaseURL: os.Getenv("DATABASE_URL"),
++		HTTPAddr:    os.Getenv("HTTP_ADDR"),
++	}
++	if cfg.HTTPAddr == "" {
++		cfg.HTTPAddr = DefaultHTTPAddr
++	}
++	if cfg.DatabaseURL == "" {
++		return Config{}, ErrMissingDatabaseURL
++	}
++	return cfg, nil
++}
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+new file mode 100644
+index 0000000..03af763
+--- /dev/null
++++ b/internal/config/config_test.go
+@@ -0,0 +1,46 @@
++package config
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestLoadMissingDatabaseURL(t *testing.T) {
++	t.Setenv("DATABASE_URL", "")
++	t.Setenv("HTTP_ADDR", "")
++	_, err := Load()
++	if err == nil {
++		t.Fatal("expected an error when DATABASE_URL is unset, got nil")
++	}
++	// The error must name the variable but never echo a value.
++	if !strings.Contains(err.Error(), "DATABASE_URL") {
++		t.Fatalf("error should name DATABASE_URL, got %q", err.Error())
++	}
++}
++
++func TestLoadDefaultsHTTPAddr(t *testing.T) {
++	t.Setenv("DATABASE_URL", "postgres://u:p@db:5432/x?sslmode=disable")
++	t.Setenv("HTTP_ADDR", "")
++	cfg, err := Load()
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if cfg.HTTPAddr != DefaultHTTPAddr {
++		t.Fatalf("HTTPAddr = %q, want %q", cfg.HTTPAddr, DefaultHTTPAddr)
++	}
++}
++
++func TestLoadHonoursHTTPAddr(t *testing.T) {
++	t.Setenv("DATABASE_URL", "postgres://u:p@db:5432/x?sslmode=disable")
++	t.Setenv("HTTP_ADDR", ":9090")
++	cfg, err := Load()
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if cfg.HTTPAddr != ":9090" {
++		t.Fatalf("HTTPAddr = %q, want :9090", cfg.HTTPAddr)
++	}
++	if cfg.DatabaseURL == "" {
++		t.Fatal("DatabaseURL should be populated")
++	}
++}
+diff --git a/internal/httpapi/router.go b/internal/httpapi/router.go
+new file mode 100644
+index 0000000..f6fcea8
+--- /dev/null
++++ b/internal/httpapi/router.go
+@@ -0,0 +1,65 @@
++// Package httpapi wires the HTTP surface for the service: the /healthz liveness
++// handler and a structured JSON error envelope used by the 404 and 405
++// fallbacks. Later epics register the product routes on this same router.
++package httpapi
++
++import (
++	"encoding/json"
++	"net/http"
++
++	"github.com/jackc/pgx/v5/pgxpool"
++)
++
++// ErrorResponse is the structured error envelope every non-2xx response the
++// service originates uses. The message is human-readable and safe to surface: it
++// carries no internal detail or secrets.
++type ErrorResponse struct {
++	Error ErrorBody `json:"error"`
++}
++
++// ErrorBody is the inner payload of ErrorResponse.
++type ErrorBody struct {
++	// Code is a stable, machine-readable token, e.g. "not_found".
++	Code string `json:"code"`
++	// Message is human-readable and safe to surface.
++	Message string `json:"message"`
++}
++
++// NewRouter builds the service router. The pool is held for the health surface
++// and for the repositories later epics attach; E1's handlers do not query it.
++func NewRouter(pool *pgxpool.Pool) http.Handler {
++	mux := http.NewServeMux()
++
++	// /healthz is defined for GET only. Registering the bare path (rather than a
++	// method-scoped pattern) lets us return the structured 405 envelope for a
++	// wrong method instead of the ServeMux default plain-text body.
++	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodGet {
++			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
++			return
++		}
++		healthz(w, r)
++	})
++
++	// Catch-all: any path not matched above is a structured 404.
++	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
++		writeError(w, http.StatusNotFound, "not_found", "resource not found")
++	})
++
++	return mux
++}
++
++// healthz is the shallow liveness handler. Reaching it already implies config,
++// the database connection, and migrations succeeded at boot.
++func healthz(w http.ResponseWriter, _ *http.Request) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(http.StatusOK)
++	_, _ = w.Write([]byte(`{"status":"ok"}` + "\n"))
++}
++
++// writeError emits the structured JSON error envelope with the given status.
++func writeError(w http.ResponseWriter, status int, code, message string) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	_ = json.NewEncoder(w).Encode(ErrorResponse{Error: ErrorBody{Code: code, Message: message}})
++}
+diff --git a/internal/httpapi/router_test.go b/internal/httpapi/router_test.go
+new file mode 100644
+index 0000000..624c0e2
+--- /dev/null
++++ b/internal/httpapi/router_test.go
+@@ -0,0 +1,68 @@
++package httpapi
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++func TestHealthzOK(t *testing.T) {
++	rr := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
++	NewRouter(nil).ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusOK {
++		t.Fatalf("status = %d, want 200", rr.Code)
++	}
++	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
++		t.Fatalf("Content-Type = %q, want application/json", ct)
++	}
++	if got := strings.TrimSpace(rr.Body.String()); got != `{"status":"ok"}` {
++		t.Fatalf("body = %q, want {\"status\":\"ok\"}", got)
++	}
++}
++
++func TestUndefinedRouteReturns404Envelope(t *testing.T) {
++	rr := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodGet, "/does-not-exist", nil)
++	NewRouter(nil).ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusNotFound {
++		t.Fatalf("status = %d, want 404", rr.Code)
++	}
++	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
++		t.Fatalf("Content-Type = %q, want application/json", ct)
++	}
++	var body ErrorResponse
++	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
++		t.Fatalf("body is not JSON: %v", err)
++	}
++	if body.Error.Code != "not_found" {
++		t.Fatalf("error.code = %q, want not_found", body.Error.Code)
++	}
++	if body.Error.Message == "" {
++		t.Fatal("error.message should be non-empty")
++	}
++}
++
++func TestWrongMethodReturns405Envelope(t *testing.T) {
++	rr := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodPost, "/healthz", nil)
++	NewRouter(nil).ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusMethodNotAllowed {
++		t.Fatalf("status = %d, want 405", rr.Code)
++	}
++	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
++		t.Fatalf("Content-Type = %q, want application/json", ct)
++	}
++	var body ErrorResponse
++	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
++		t.Fatalf("body is not JSON: %v", err)
++	}
++	if body.Error.Code != "method_not_allowed" {
++		t.Fatalf("error.code = %q, want method_not_allowed", body.Error.Code)
++	}
++}
+diff --git a/internal/migrate/migrate.go b/internal/migrate/migrate.go
+new file mode 100644
+index 0000000..a6a3143
+--- /dev/null
++++ b/internal/migrate/migrate.go
+@@ -0,0 +1,108 @@
++// Package migrate wraps the golang-migrate runner the api invokes at startup.
++// It applies all pending migrations to the latest version before the server
++// binds. E1 ships an empty migrations directory, so the runner finds nothing to
++// apply, which is treated as success.
++//
++// Errors are scrubbed of the DSN: golang-migrate wraps the underlying driver
++// error, which can embed the connection string, so callers must log
++// SafeReason(err, dsn) rather than err.Error() verbatim.
++package migrate
++
++import (
++	"errors"
++	"fmt"
++	"net/url"
++	"os"
++	"strings"
++
++	"github.com/golang-migrate/migrate/v4"
++	// Postgres database driver and file source, registered via blank import.
++	_ "github.com/golang-migrate/migrate/v4/database/postgres"
++	_ "github.com/golang-migrate/migrate/v4/source/file"
++)
++
++// Run applies all pending migrations found under dir against the database named
++// by dsn. It returns a short human-readable status ("applied" or a "no change"
++// variant) and an error.
++//
++// Two non-error cases both mean "nothing to apply": golang-migrate's ErrNoChange
++// (migration files exist but none are pending) and a present-but-empty
++// migrations directory (E1 ships no migration files, for which the file source
++// reports "file does not exist"). A genuinely missing directory, or a real
++// migration failure when migration files are present, is a hard error.
++func Run(dsn, dir string) (status string, err error) {
++	// A missing migrations directory is a real misconfiguration; only a present
++	// but empty directory is E1's expected no-op.
++	if fi, statErr := os.Stat(dir); statErr != nil || !fi.IsDir() {
++		return "", fmt.Errorf("migrations directory %q is not present", dir)
++	}
++
++	m, err := migrate.New("file://"+dir, dsn)
++	if err != nil {
++		// A genuine runner-construction failure (bad DSN, driver init, DB
++		// unreachable) must surface — never mask it just because the dir is
++		// empty.
++		return "", err
++	}
++	defer m.Close()
++
++	// Empty source is a deterministic no-op: the runner is constructed and has
++	// nothing to apply. Short-circuit here rather than calling Up() and trying to
++	// tell its "no migration files" error apart from a real failure once
++	// golang-migrate has wrapped it — that ambiguity is exactly what would let a
++	// real error be swallowed on E1's always-empty dir.
++	if noMigrationFiles(dir) {
++		return "no change (empty migrations dir)", nil
++	}
++
++	// A present, non-empty dir: apply. Only ErrNoChange is a no-op; every other
++	// error is a genuine migration failure and surfaces.
++	switch upErr := m.Up(); {
++	case upErr == nil:
++		return "applied", nil
++	case errors.Is(upErr, migrate.ErrNoChange):
++		return "no change", nil
++	default:
++		return "", upErr
++	}
++}
++
++// noMigrationFiles reports whether dir contains no *.sql migration files.
++func noMigrationFiles(dir string) bool {
++	entries, err := os.ReadDir(dir)
++	if err != nil {
++		return false
++	}
++	for _, e := range entries {
++		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
++			return false
++		}
++	}
++	return true
++}
++
++// SafeReason returns a secret-free reason string for a migration error, with any
++// DSN or password substring redacted from the wrapped driver error text.
++func SafeReason(err error, dsn string) string {
++	if err == nil {
++		return ""
++	}
++	return "migration runner failed: " + scrub(err.Error(), dsn)
++}
++
++func scrub(msg, dsn string) string {
++	if dsn == "" {
++		return msg
++	}
++	out := strings.ReplaceAll(msg, dsn, "[redacted-dsn]")
++	if u, err := url.Parse(dsn); err == nil && u.User != nil {
++		if pw, ok := u.User.Password(); ok && pw != "" {
++			// Redact the password and its common encoded forms, so a driver
++			// error that reproduced it percent-encoded still cannot leak it.
++			for _, form := range []string{pw, url.QueryEscape(pw), url.PathEscape(pw)} {
++				out = strings.ReplaceAll(out, form, "[redacted]")
++			}
++		}
++	}
++	return out
++}
+diff --git a/internal/migrate/migrate_test.go b/internal/migrate/migrate_test.go
+new file mode 100644
+index 0000000..df6baa8
+--- /dev/null
++++ b/internal/migrate/migrate_test.go
+@@ -0,0 +1,47 @@
++package migrate
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func TestRunMissingDirIsError(t *testing.T) {
++	// A missing migrations directory is a real misconfiguration and must error
++	// before any database contact.
++	_, err := Run("postgres://u:p@localhost:1/none?sslmode=disable", filepath.Join(t.TempDir(), "nope"))
++	if err == nil {
++		t.Fatal("expected an error for a missing migrations directory")
++	}
++	if !strings.Contains(err.Error(), "not present") {
++		t.Fatalf("error should mention the directory is not present, got %q", err.Error())
++	}
++}
++
++func TestNoMigrationFiles(t *testing.T) {
++	empty := t.TempDir()
++	if !noMigrationFiles(empty) {
++		t.Fatal("empty dir should report no migration files")
++	}
++
++	withSQL := t.TempDir()
++	if err := os.WriteFile(filepath.Join(withSQL, "0001_init.up.sql"), []byte("SELECT 1;"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if noMigrationFiles(withSQL) {
++		t.Fatal("dir with a .sql file should report migration files present")
++	}
++}
++
++func TestSafeReasonScrubsDSN(t *testing.T) {
++	dsn := "postgres://user:sup3rSecret@db:5432/app?sslmode=disable"
++	reason := SafeReason(errString("failed: "+dsn), dsn)
++	if strings.Contains(reason, "sup3rSecret") || strings.Contains(reason, dsn) {
++		t.Fatalf("reason leaked the DSN/password: %q", reason)
++	}
++}
++
++type errString string
++
++func (e errString) Error() string { return string(e) }
+diff --git a/internal/store/store.go b/internal/store/store.go
+new file mode 100644
+index 0000000..d4d60eb
+--- /dev/null
++++ b/internal/store/store.go
+@@ -0,0 +1,85 @@
++// Package store owns the Postgres connection foundation: it constructs a
++// pgxpool and confirms connectivity with a single Ping at startup. It exposes
++// no queries yet; the links repository lands in a later epic.
++//
++// Every error this package surfaces is scrubbed of the DSN. A raw pgx parse or
++// connection error frequently embeds the connection string (host, user, and
++// password), so callers must log SafeReason(err, dsn), never err.Error()
++// verbatim.
++package store
++
++import (
++	"context"
++	"net/url"
++	"strings"
++	"time"
++
++	"github.com/jackc/pgx/v5/pgxpool"
++)
++
++// connectTimeout bounds the parse+connect+ping sequence at startup.
++const connectTimeout = 10 * time.Second
++
++// parseError marks a failure to parse the DSN. The underlying pgx parse error is
++// deliberately discarded because it can echo the DSN verbatim.
++type parseError struct{}
++
++func (parseError) Error() string { return "DATABASE_URL is malformed and could not be parsed" }
++
++// Open parses the DSN, constructs a pgxpool, and Pings once to confirm the
++// database is reachable. On any failure it returns an error that is safe to pass
++// to SafeReason for logging.
++func Open(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
++	poolCfg, err := pgxpool.ParseConfig(dsn)
++	if err != nil {
++		return nil, parseError{}
++	}
++
++	ctx, cancel := context.WithTimeout(ctx, connectTimeout)
++	defer cancel()
++
++	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
++	if err != nil {
++		return nil, err
++	}
++	if err := pool.Ping(ctx); err != nil {
++		pool.Close()
++		return nil, err
++	}
++	return pool, nil
++}
++
++// SafeReason returns a stable, secret-free reason string for a store error. It
++// never contains the DSN or its password. When the error is not a known parse
++// failure it redacts any DSN or password substring from the driver error text
++// before returning it, so a wrapped pgx error can never leak the connection
++// string into the logs.
++func SafeReason(err error, dsn string) string {
++	if err == nil {
++		return ""
++	}
++	if _, ok := err.(parseError); ok {
++		return err.Error()
++	}
++	return "could not connect to the database named by DATABASE_URL: " + scrub(err.Error(), dsn)
++}
++
++// scrub removes the DSN and its password from a message. It replaces the whole
++// DSN string first, then the parsed password (in case the driver reconstructed
++// or partially quoted the connection string).
++func scrub(msg, dsn string) string {
++	if dsn == "" {
++		return msg
++	}
++	out := strings.ReplaceAll(msg, dsn, "[redacted-dsn]")
++	if u, err := url.Parse(dsn); err == nil && u.User != nil {
++		if pw, ok := u.User.Password(); ok && pw != "" {
++			// Redact the password and its common encoded forms, so a driver
++			// error that reproduced it percent-encoded still cannot leak it.
++			for _, form := range []string{pw, url.QueryEscape(pw), url.PathEscape(pw)} {
++				out = strings.ReplaceAll(out, form, "[redacted]")
++			}
++		}
++	}
++	return out
++}
+diff --git a/internal/store/store_test.go b/internal/store/store_test.go
+new file mode 100644
+index 0000000..5a62df6
+--- /dev/null
++++ b/internal/store/store_test.go
+@@ -0,0 +1,34 @@
++package store
++
++import (
++	"strings"
++	"testing"
++)
++
++// A recognisable password token used to prove it is never surfaced in a reason.
++const secretToken = "sup3rSecret"
++
++func TestSafeReasonScrubsPasswordFromDriverError(t *testing.T) {
++	dsn := "postgres://user:" + secretToken + "@db:5432/app?sslmode=disable"
++	// Simulate a wrapped driver error that embedded the whole DSN.
++	drvErr := errString("dial error connecting with " + dsn)
++	reason := SafeReason(drvErr, dsn)
++	if strings.Contains(reason, secretToken) {
++		t.Fatalf("reason leaked the password token: %q", reason)
++	}
++	if strings.Contains(reason, dsn) {
++		t.Fatalf("reason leaked the raw DSN: %q", reason)
++	}
++}
++
++func TestSafeReasonParseErrorHasNoValue(t *testing.T) {
++	dsn := "not://a valid dsn:" + secretToken + "@"
++	reason := SafeReason(parseError{}, dsn)
++	if strings.Contains(reason, secretToken) {
++		t.Fatalf("parse-error reason leaked the token: %q", reason)
++	}
++}
++
++type errString string
++
++func (e errString) Error() string { return string(e) }
+diff --git a/migrations/.gitkeep b/migrations/.gitkeep
+new file mode 100644
+index 0000000..e69de29
+diff --git a/scripts/ci-gofmt.sh b/scripts/ci-gofmt.sh
+new file mode 100755
+index 0000000..cfbca57
+--- /dev/null
++++ b/scripts/ci-gofmt.sh
+@@ -0,0 +1,10 @@
++#!/usr/bin/env bash
++# Fail if any Go source is not gofmt-clean. Runs gofmt in the pinned Go image.
++set -euo pipefail
++unformatted=$(docker run --rm -v "$PWD":/src -w /src -e GOTOOLCHAIN=local golang:1.22-alpine gofmt -l .)
++if [ -n "$unformatted" ]; then
++  echo "gofmt: the following files are not formatted:"
++  echo "$unformatted"
++  exit 1
++fi
++echo "gofmt: clean"

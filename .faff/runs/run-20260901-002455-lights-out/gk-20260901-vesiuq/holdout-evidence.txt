@@ -1,0 +1,42 @@
+Holdout evidence — gk-20260901-vesiuq (E2) — code-blind, against the running compose stack
+env-handle: api http://localhost:8080 (/healthz -> {"status":"ok"}), db endpoint via env DSN (Postgres 16)
+Exercised using ONLY the spec's criterion text + the env endpoints/DSN. Never the diff/code.
+
+BORN-VERIFIABLE SCENARIOS (11) + 1 ASSERTION:
+
+S1 (holdout) MET — schema_migrations + links columns
+  schema_migrations: version=1, dirty=false
+  links columns: code:text:NOT NULL (PK) | url:text:NOT NULL | created_at:timestamptz:NOT NULL default now() | expires_at:timestamptz:NULLABLE
+
+S2 / ASSERTION MET — restart api -> "no change", schema unchanged
+  api log after restart: migration runner ran: "no change"
+  schema_migrations still 1,false; links still 4 columns
+
+S3 MET — insert omitting created_at -> DB DEFAULT now() populated
+  INSERT (code,url,expires_at)=('h_abc','https://example.com/x',NULL); SELECT -> url match, expires NULL, created_at=2026-09-01T07:03:33 (non-zero, within insert window)
+
+S4 MET — non-nil expires_at microsecond round-trip
+  INSERT expires_at='2030-01-02T03:04:05.123456Z'; read back (UTC) = 2030-01-02T03:04:05.123456 (no tz shift, no truncation)
+
+S5 (holdout) MET — absent code yields no row (ByCode not-found manifestation)
+  SELECT ... WHERE code='never-inserted-xyz' -> 0 rows
+
+S6 MET — duplicate primary key rejected, existing row unchanged
+  second INSERT code='h_abc' -> ERROR duplicate key value violates unique constraint "links_pkey"; h_abc url unchanged (https://example.com/x)
+
+S8 MET — long (44-char) + non-ASCII UTF-8 code/url round-trip byte-for-byte
+  code match=true, url match=true (https://example.com/über/long/path?q=1), len=44
+
+S9 MET — empty-string code+url persisted (E2 does not validate)
+  INSERT ('','') succeeds; row present with empty code and url
+
+S10 MET — links table is a real table a plain CREATE collides with
+  CREATE TABLE links (...) again -> ERROR relation "links" already exists (running-stack observable of the plain-CREATE / not-IF-NOT-EXISTS property)
+
+S7 NEEDS-HUMAN — down-migration file correctness
+  The scenario asserts applying the shipped 000001_create_links.down.sql drops the table and re-applying up restores it. The running stack (api runs UP only at startup; no down trigger; no migration-file access code-blind) exposes NO surface to apply the shipped down file. Fail-closed to needs-human. (Independently verified by graft's internal/store down/up integration test.)
+
+S11 (holdout) NEEDS-HUMAN — query-path DSN-free error
+  The scenario forces a store query-path error (Insert/ByCode against a dropped table) and inspects the store method's RETURNED error text for DSN/password leakage. The running api exposes only /healthz (shallow, no query) and no HTTP endpoint invokes Insert/ByCode, so no query-path error can be triggered through the running stack. The connect-path DSN scrubbing (E1's SafeReason) is startup-observable, but the E2 query-path is not. Fail-closed to needs-human. (Independently verified by graft's internal/store TestQueryPathErrorCarriesNoDSN.)
+
+DERIVATION: 10 met + 2 needs-human -> aggregate = needs-human (any needs-human criterion forces needs-human; canonical per faff contract holdout-verdict).

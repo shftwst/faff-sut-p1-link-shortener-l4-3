@@ -1,0 +1,10 @@
+[
+  { "lens": "architectural", "outcome": "clear", "objections": [], "model": "openai/google/gemma-4-31b-it" },
+  { "lens": "infosec", "outcome": "clear", "objections": [], "model": "openai/google/gemma-4-31b-it" },
+  { "lens": "methodology", "outcome": "clear", "objections": [], "model": "openai/unsloth/Qwen3.8-27B-NVFP4" },
+  { "lens": "QA", "outcome": "refuted", "model": "openai/google/gemma-4-31b-it", "objections": [
+    { "severity": "major", "claim": "expires_at non-nil round-trip not verified", "predicted_consequence": "timestamp truncation/tz-shift/scan bug uncaught", "spec_anchor": "scenarios", "summary": "missing scenario for non-nil expiry round-trip" },
+    { "severity": "major", "claim": "DSN-free query errors have no verifiable scenario", "predicted_consequence": "build could leak DSN on a query error and still pass", "spec_anchor": "done-definition-of-done", "summary": "unverified DSN-free query errors" },
+    { "severity": "minor", "claim": "created_at non-zero is a weak oracle for DEFAULT now()", "predicted_consequence": "hard-coded/dummy date passes non-zero check", "spec_anchor": "scenarios", "summary": "weak oracle for created_at" }
+  ] }
+]

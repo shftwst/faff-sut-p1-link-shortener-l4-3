@@ -1,0 +1,3 @@
+{ "issue": "gk-20260901-vesiuq", "spec_produced": true, "attached": true, "mode": "git-only", "ts": "2026-09-01T05:02:18Z",
+  "owner": { "run_dir": "/Users/shftwst/workspace/shftwst/faff-sut-p1-link-shortener-l4-3/.faff/runs/run-20260901-002455-lights-out", "pid": 0 },
+  "harness": "claude-code", "model": "unknown" }

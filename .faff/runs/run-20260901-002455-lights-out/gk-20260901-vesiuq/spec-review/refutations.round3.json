@@ -1,0 +1,10 @@
+[
+  { "lens": "architectural", "outcome": "clear", "objections": [], "model": "openai/google/gemma-4-31b-it" },
+  { "lens": "infosec", "outcome": "clear", "objections": [], "model": "openai/google/gemma-4-31b-it" },
+  { "lens": "methodology", "outcome": "clear", "objections": [], "model": "openai/unsloth/Qwen3.8-27B-NVFP4" },
+  { "lens": "QA", "outcome": "refuted", "model": "openai/google/gemma-4-31b-it", "objections": [
+    { "severity": "major", "claim": "IF NOT EXISTS prohibition not verifiable — no scenario asserts a re-apply of the raw up DDL errors", "predicted_consequence": "a dev could add IF NOT EXISTS undetected", "spec_anchor": "design-decision-rationale", "summary": "IF NOT EXISTS not verifiable" },
+    { "severity": "minor", "claim": "empty-string boundary untested for the no-validation decision", "predicted_consequence": "a dev adds an empty-string reject, pulling E3 forward, uncaught", "spec_anchor": "how-behaviour", "summary": "empty-string boundary untested" },
+    { "severity": "minor", "claim": "created_at oracle cannot distinguish DB DEFAULT from app-set time in the INSERT", "predicted_consequence": "app-set created_at passes the window oracle", "spec_anchor": "how-behaviour", "summary": "created_at oracle ambiguous" }
+  ] }
+]

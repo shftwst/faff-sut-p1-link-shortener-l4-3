@@ -1,0 +1,6 @@
+[
+  { "lens": "architectural", "outcome": "clear", "objections": [], "model": "openai/google/gemma-4-31b-it" },
+  { "lens": "infosec", "outcome": "clear", "objections": [], "model": "openai/unsloth/Qwen3.8-27B-NVFP4" },
+  { "lens": "methodology", "outcome": "clear", "objections": [], "model": "openai/google/gemma-4-31b-it" },
+  { "lens": "QA", "outcome": "clear", "objections": [], "model": "openai/google/gemma-4-31b-it" }
+]

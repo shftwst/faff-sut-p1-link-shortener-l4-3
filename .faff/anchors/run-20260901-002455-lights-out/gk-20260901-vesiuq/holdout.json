@@ -1,0 +1,67 @@
+{
+  "aggregate": "needs-human",
+  "code_blind": true,
+  "criteria": [
+    {
+      "class": "scenario",
+      "verdict": "met",
+      "evidence_present": true
+    },
+    {
+      "class": "scenario",
+      "verdict": "met",
+      "evidence_present": true
+    },
+    {
+      "class": "scenario",
+      "verdict": "met",
+      "evidence_present": true
+    },
+    {
+      "class": "scenario",
+      "verdict": "met",
+      "evidence_present": true
+    },
+    {
+      "class": "scenario",
+      "verdict": "met",
+      "evidence_present": true
+    },
+    {
+      "class": "scenario",
+      "verdict": "met",
+      "evidence_present": true
+    },
+    {
+      "class": "scenario",
+      "verdict": "met",
+      "evidence_present": true
+    },
+    {
+      "class": "scenario",
+      "verdict": "met",
+      "evidence_present": true
+    },
+    {
+      "class": "scenario",
+      "verdict": "met",
+      "evidence_present": true
+    },
+    {
+      "class": "assertion",
+      "verdict": "met",
+      "evidence_present": true
+    },
+    {
+      "class": "scenario",
+      "verdict": "needs-human",
+      "evidence_present": false
+    },
+    {
+      "class": "scenario",
+      "verdict": "needs-human",
+      "evidence_present": false
+    }
+  ],
+  "violations": []
+}

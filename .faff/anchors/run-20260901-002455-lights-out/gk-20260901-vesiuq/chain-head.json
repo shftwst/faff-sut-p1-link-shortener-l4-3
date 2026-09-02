@@ -1,0 +1,8 @@
+{
+  "run_id": "run-20260901-002455-lights-out",
+  "issue": "gk-20260901-vesiuq",
+  "head_seq": 17,
+  "head_sha256": "aca7d4ae25805a6e88d3fd1d8c1ecb968799c080b2e4e9781e57fb02bf4cdafa",
+  "line_count": 18,
+  "schema_floor": 2
+}

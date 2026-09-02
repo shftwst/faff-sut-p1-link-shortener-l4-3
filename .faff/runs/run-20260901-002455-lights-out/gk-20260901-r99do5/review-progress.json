@@ -1,0 +1,14 @@
+{
+  "issue": "gk-20260901-r99do5",
+  "phase1": {
+    "status": "done",
+    "verdict": "pass",
+    "diff_hash": "72ea5a188535fc6306da6315c5944383f313fdfd0b6c575b4dc511f24d19ef4e"
+  },
+  "phase2": {
+    "status": "complete",
+    "attempts": 0,
+    "findings_ref": "/Users/shftwst/workspace/shftwst/faff-sut-p1-link-shortener-l4-3/.faff/runs/run-20260901-002455-lights-out/gk-20260901-r99do5/adversarial-findings.txt"
+  },
+  "updated_at": "2026-09-01T04:43:34.664Z"
+}
